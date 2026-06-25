@@ -1,0 +1,1180 @@
+# VisiBox — PRD Revisi
+
+## Shell Execution Engine untuk AI Agent: ID-based, Interactive Session, Pagination
+
+---
+
+## KOREKSI VISI
+
+Saya salah arah sebelumnya. Inti VisiBox bukan "semantic translator" atau "safety guard" — itu fitur tambahan. **Intinya ada 3 pilar:**
+
+```
+┌──────────────────────────────────────────────────────┐
+│                    VISIBOX CORE                       │
+│                                                       │
+│   1. SETIAP COMMAND PUNYA ID                          │
+│      request_id + response_id                         │
+│      → trackable, auditable, referensiable            │
+│                                                       │
+│   2. INTERACTIVE SESSION CONTROL                      │
+│      → spawn session (ssh, python, mysql, dll)        │
+│      → kirim input, baca output, lanjut kapan saja    │
+│      → session hidup terpisah dari command            │
+│                                                       │
+│   3. OUTPUT PAGINATION                                │
+│      → output dibatasi sesuai config                  │
+│      → ambil halaman berikutnya kalau perlu           │
+│      → AI tidak tenggelam oleh output 10.000 baris    │
+└──────────────────────────────────────────────────────┘
+```
+
+---
+
+## 1. COMMAND ID SYSTEM
+
+### Konsep
+
+Setiap operasi di VisiBox — baik command sekali jalan maupun input ke interactive session — punya **dua ID**:
+
+```
+REQUEST_ID   →  ID yang dikirim AI agent (boleh buatan AI, boleh auto)
+RESPONSE_ID  →  ID yang di-generate VisiBox untuk setiap response
+```
+
+```
+┌─────────────────┐          ┌─────────────────┐
+│    AI AGENT      │          │    VISIBOX       │
+│                  │          │                  │
+│  request_id:     │─────────▶│  VALIDATE ID     │
+│  "req_001"       │          │                  │
+│                  │          │  GENERATE        │
+│  command:        │          │  response_id:    │
+│  "df -h"         │          │  "res_a7f3c2"    │
+│                  │          │                  │
+│                  │◀─────────│  EXECUTE + RETURN │
+│  response_id:    │          │                  │
+│  "res_a7f3c2"    │          │                  │
+│  request_id:     │          │                  │
+│  "req_001"       │          │                  │
+│  exit_code: 0    │          │                  │
+│  data: {...}     │          │                  │
+└─────────────────┘          └─────────────────┘
+```
+
+**Kenapa 2 ID?**
+
+```
+REQUEST_ID:
+  → milik AI agent, bisa apa saja (UUID, sequential, meaningful string)
+  → dipakai AI untuk referensi: "hasil dari req_001 tadi..."
+  → optional: kalau AI tidak kirim, VisiBox auto-generate
+
+RESPONSE_ID:
+  → milik VisiBox, format konsisten: res_{8-char-hex}
+  → unik global, tidak pernah duplikat
+  → dipakai untuk: pagination, rollback, audit, referensi silang
+```
+
+### Wire Format
+
+```json
+// REQUEST dari AI Agent
+{
+  "request_id": "req_001",
+  "type": "execute",
+  "command": "df -h",
+  "options": {
+    "output_limit": 50
+  }
+}
+
+// RESPONSE dari VisiBox
+{
+  "request_id": "req_001",
+  "response_id": "res_a7f3c2d1",
+  "type": "execute_result",
+  "command": "df -h",
+  "exit_code": 0,
+  "started_at": "2026-06-25T10:30:00.000Z",
+  "finished_at": "2026-06-25T10:30:00.045Z",
+  "duration_ms": 45,
+  "output": "Filesystem      Size  Used Avail Use% Mounted on\n/dev/sda1        50G   35G   13G  73% /",
+  "output_truncated": false,
+  "pagination": null
+}
+```
+
+---
+
+## 2. INTERACTIVE SESSION CONTROL
+
+Ini **fitur pembeda utama** VisiBox. AI agent bisa mengendalikan program interaktif yang berjalan terus-menerus.
+
+### Masalah yang Diselesaikan
+
+```
+TANPA VisiBox:
+──────────────
+AI: "ssh ke server, cek proses, lalu restart service"
+AI: → ssh user@server       ← hang, menunggu password
+AI: → stuck forever
+
+ATAU pakai non-interactive:
+AI: → ssh user@server "ps aux"    ← works, tapi...
+AI: → ssh user@server "sudo systemctl restart nginx"  ← perlu password lagi
+AI: → setiap command = connection baru, tidak ada state
+
+DENGAN VisiBox:
+───────────────
+AI: → start_session("ssh user@server")
+VISIBOX: → session_id: "sess_f1a2b3", output: "password: "
+AI: → send_input("sess_f1a2b3", "mypassword\n")
+VISIBOX: → output: "Welcome to Ubuntu 24.04...\nuser@server:~$"
+AI: → send_input("sess_f1a2b3", "ps aux --sort=-%mem | head")
+VISIBOX: → output: "USER  PID  %CPU %MEM COMMAND\n..."
+AI: → send_input("sess_f1a2b3", "sudo systemctl restart nginx")
+VISIBOX: → output: "[sudo] password for user: "
+AI: → send_input("sess_f1a2b3", "mypassword\n")
+VISIBOX: → output: ""
+AI: → close_session("sess_f1a2b3")
+```
+
+### Session Lifecycle
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                   SESSION LIFECYCLE                            │
+│                                                               │
+│  START                  ACTIVE                   CLOSE        │
+│  ────                   ──────                   ─────        │
+│  │                       │                       │            │
+│  ▼                       ▼                       ▼            │
+│  ┌─────────┐    ┌──────────────────────┐    ┌─────────┐      │
+│  │ SPAWN   │    │  INTERACTIVE LOOP    │    │ CLEANUP │      │
+│  │         │    │                      │    │         │      │
+│  │ • PTY   │    │  AI → send_input()   │    │ • kill  │      │
+│  │ • env   │    │  VisiBox → output    │    │ • PTY   │      │
+│  │ • fork  │    │  AI → send_input()   │    │ • free  │      │
+│  │         │    │  VisiBox → output    │    │ • log   │      │
+│  │         │    │  ...                 │    │         │      │
+│  └─────────┘    └──────────────────────┘    └─────────┘      │
+│                                                               │
+│  Setiap send_input dan setiap output = punya response_id     │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### API Session
+
+```bash
+# ═══════════════════════════════════════
+# START SESSION
+# ═══════════════════════════════════════
+
+# Request
+{
+  "request_id": "req_010",
+  "type": "session_start",
+  "command": "ssh user@192.168.1.100",
+  "options": {
+    "env": {"TERM": "xterm-256color"},
+    "cwd": "/home/user",
+    "output_read_timeout_ms": 5000,
+    "output_limit": 100
+  }
+}
+
+# Response
+{
+  "request_id": "req_010",
+  "response_id": "res_f1a2b3c4",
+  "type": "session_started",
+  "session_id": "sess_9d8e7f6a",
+  "status": "active",
+  "output": "user@192.168.1.100's password: ",
+  "output_truncated": false
+}
+
+
+# ═══════════════════════════════════════
+# SEND INPUT TO SESSION
+# ═══════════════════════════════════════
+
+# Request
+{
+  "request_id": "req_011",
+  "type": "session_input",
+  "session_id": "sess_9d8e7f6a",
+  "input": "mypassword\n",
+  "options": {
+    "wait_for_prompt": true,
+    "prompt_pattern": "\\$\\s*$",
+    "timeout_ms": 10000,
+    "output_limit": 100
+  }
+}
+
+# Response
+{
+  "request_id": "req_011",
+  "response_id": "res_b5c6d7e8",
+  "type": "session_output",
+  "session_id": "sess_9d8e7f6a",
+  "exit_code": null,
+  "status": "active",
+  "output": "Welcome to Ubuntu 24.04.2 LTS (GNU/Linux 6.5.0-generic x86_64)\n\nLast login: Wed Jun 25 10:00:00 2026\nuser@server:~$ ",
+  "output_truncated": false,
+  "prompt_detected": true
+}
+
+
+# ═══════════════════════════════════════
+# READ OUTPUT (tanpa mengirim input)
+# ═══════════════════════════════════════
+
+# Request
+{
+  "request_id": "req_012",
+  "type": "session_read",
+  "session_id": "sess_9d8e7f6a",
+  "options": {
+    "timeout_ms": 3000,
+    "output_limit": 50
+  }
+}
+
+# Response (kalau ada output baru)
+{
+  "request_id": "req_012",
+  "response_id": "res_c9d0e1f2",
+  "type": "session_output",
+  "session_id": "sess_9d8e7f6a",
+  "status": "active",
+  "output": "",
+  "output_truncated": false
+}
+
+
+# ═══════════════════════════════════════
+# LIST ACTIVE SESSIONS
+# ═══════════════════════════════════════
+
+# Request
+{
+  "request_id": "req_020",
+  "type": "session_list"
+}
+
+# Response
+{
+  "request_id": "req_020",
+  "response_id": "res_list01",
+  "type": "session_list",
+  "sessions": [
+    {
+      "session_id": "sess_9d8e7f6a",
+      "command": "ssh user@192.168.1.100",
+      "status": "active",
+      "started_at": "2026-06-25T10:30:00Z",
+      "last_activity": "2026-06-25T10:35:00Z",
+      "total_input_sent": 5,
+      "total_output_bytes": 4502
+    },
+    {
+      "session_id": "sess_a1b2c3d4",
+      "command": "python3",
+      "status": "active",
+      "started_at": "2026-06-25T10:32:00Z",
+      "last_activity": "2026-06-25T10:34:00Z",
+      "total_input_sent": 3,
+      "total_output_bytes": 1200
+    }
+  ]
+}
+
+
+# ═══════════════════════════════════════
+# CLOSE SESSION
+# ═══════════════════════════════════════
+
+# Request
+{
+  "request_id": "req_030",
+  "type": "session_close",
+  "session_id": "sess_9d8e7f6a",
+  "options": {
+    "graceful": true,
+    "send_signal": "SIGTERM",
+    "wait_ms": 3000
+  }
+}
+
+# Response
+{
+  "request_id": "req_030",
+  "response_id": "res_close1",
+  "type": "session_closed",
+  "session_id": "sess_9d8e7f6a",
+  "final_output": "Connection to 192.168.1.100 closed.\n",
+  "session_duration_ms": 345000
+}
+```
+
+---
+
+## 3. OUTPUT PAGINATION
+
+### Masalah
+
+```
+AI agent jalankan: dmesg
+Output: 50.000 baris, 2.3MB teks
+
+TANPA pagination:
+  → AI agent menerima 2.3MB → token explosion → mahal, lambat, kehilangan konteks
+
+DENGAN pagination:
+  → AI agent menerima 50 baris pertama + metadata pagination
+  → Kalau butuh lagi, minta halaman berikutnya
+  → Kontrol penuh di tangan AI agent
+```
+
+### Pagination Model
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                  PAGINATION MODEL                             │
+│                                                               │
+│  FULL OUTPUT:  [████████████████████████████████] 50.000 baris│
+│                                                               │
+│  PAGE 1:       [███░░░░░░░░░░░░░░░░░░░░░░░░░░░░] baris 1-50  │
+│                 ← AI terima ini                               │
+│                                                               │
+│  PAGE 2:       [░░░███░░░░░░░░░░░░░░░░░░░░░░░░░] baris 51-100│
+│                 ← AI minta kalau butuh                        │
+│                                                               │
+│  PAGE 3:       [░░░░░░███░░░░░░░░░░░░░░░░░░░░░░] baris 101.. │
+│                 ← dst...                                      │
+│                                                               │
+│  Setiap page punya cursor/token untuk ambil page berikutnya   │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Setting Pagination
+
+```json
+// Global config
+{
+  "pagination": {
+    "mode": "lines",          // "lines" | "bytes" | "auto"
+    "default_page_size": 100,  // default 100 baris per page
+    "max_page_size": 500,      // AI boleh request max 500 baris
+    "min_page_size": 10,       // minimum 10 baris
+    "include_total": true,     // hitung total baris/buffer
+    "cursor_expiry_ms": 300000 // cursor expired setelah 5 menit
+  }
+}
+```
+
+### Wire Format
+
+```json
+// REQUEST: command biasa dengan pagination
+{
+  "request_id": "req_050",
+  "type": "execute",
+  "command": "dmesg --level=err,warn",
+  "options": {
+    "output_limit": 50,           // ambil 50 baris pertama
+    "output_unit": "lines"        // atau "bytes"
+  }
+}
+
+// RESPONSE: output dipaginasi
+{
+  "request_id": "req_050",
+  "response_id": "res_page01",
+  "type": "execute_result",
+  "command": "dmesg --level=err,warn",
+  "exit_code": 0,
+  "duration_ms": 120,
+  "output": "[    0.000000] ACPI BIOS Error ...\n[    1.234567] ata1.00: failed to IDENTIFY ...\n...",
+  "output_lines": 50,
+  "output_truncated": true,
+  "pagination": {
+    "current_page": 1,
+    "page_size": 50,
+    "total_lines": 847,
+    "total_pages": 17,
+    "has_next": true,
+    "next_cursor": "cur_8f7e6d5c4b3a",
+    "has_prev": false,
+    "prev_cursor": null
+  }
+}
+
+
+// REQUEST: ambil halaman berikutnya
+{
+  "request_id": "req_051",
+  "type": "fetch_page",
+  "response_id": "res_page01",    // referensi ke response sebelumnya
+  "cursor": "cur_8f7e6d5c4b3a",
+  "options": {
+    "output_limit": 50
+  }
+}
+
+// RESPONSE: halaman berikutnya
+{
+  "request_id": "req_051",
+  "response_id": "res_page02",
+  "type": "page_result",
+  "reference_response_id": "res_page01",
+  "output": "...",
+  "output_lines": 50,
+  "output_truncated": true,
+  "pagination": {
+    "current_page": 2,
+    "page_size": 50,
+    "total_lines": 847,
+    "total_pages": 17,
+    "has_next": true,
+    "next_cursor": "cur_1a2b3c4d5e6f",
+    "has_prev": true,
+    "prev_cursor": "cur_prev_page1"
+  }
+}
+
+
+// REQUEST: ambil semua output sekaligus (override pagination)
+{
+  "request_id": "req_060",
+  "type": "execute",
+  "command": "ls -la /var/log/",
+  "options": {
+    "output_limit": null           // null = semua output, tanpa pagination
+  }
+}
+
+// REQUEST: unit bytes bukan lines
+{
+  "request_id": "req_070",
+  "type": "execute",
+  "command": "cat /var/log/syslog",
+  "options": {
+    "output_limit": 4096,          // 4KB pertama
+    "output_unit": "bytes"
+  }
+}
+```
+
+### Pagination di Interactive Session
+
+```json
+// Session juga bisa paginated
+{
+  "request_id": "req_080",
+  "type": "session_input",
+  "session_id": "sess_9d8e7f6a",
+  "input": "SELECT * FROM users;\n",
+  "options": {
+    "output_limit": 25,            // 25 baris pertama dari hasil query
+    "wait_for_prompt": true
+  }
+}
+
+// Response
+{
+  "request_id": "req_080",
+  "response_id": "res_query01",
+  "type": "session_output",
+  "session_id": "sess_9d8e7f6a",
+  "status": "active",
+  "output": "+----+----------+---------------------+\n| id | name     | email               |\n+----+----------+---------------------+\n| 1  | Alice    | alice@example.com   |\n...",
+  "output_truncated": true,
+  "pagination": {
+    "current_page": 1,
+    "page_size": 25,
+    "total_lines": 1523,
+    "has_next": true,
+    "next_cursor": "cur_sess_out_abc"
+  }
+}
+
+// Ambil sisa output
+{
+  "request_id": "req_081",
+  "type": "session_fetch_page",
+  "session_id": "sess_9d8e7f6a",
+  "cursor": "cur_sess_out_abc",
+  "options": {
+    "output_limit": 100
+  }
+}
+```
+
+---
+
+## 4. ARSITEKTUR MODIFIKASI BASH SOURCE
+
+```
+visibox/
+├── (bash source dari Savannah)
+│
+├── shell/
+│   ├── visibox_core.c          # Entry point, mode switcher
+│   ├── visibox_id.c            # ID generator & registry
+│   ├── visibox_session.c       # PTY session manager
+│   ├── visibox_session_pty.c   # PTY spawn, read, write
+│   ├── visibox_session_io.c    # Non-blocking I/O multiplexing
+│   ├── visibox_paginator.c     # Output buffer + pagination engine
+│   ├── visibox_protocol.c      # JSON request/response serializer
+│   ├── visibox_dispatch.c      # Command dispatch (direct vs session)
+│   ├── visibox_store.c         # Response history store (in-memory ring)
+│   │
+│   ├── execute_cmd.c           # MODIFIED: inject ID, capture output
+│   ├── eval.c                  # MODIFIED: visibox dispatch hook
+│   └── input.c                 # MODIFIED: read from stdin/pipe/socket
+│
+├── include/
+│   └── visibox.h               # All declarations + struct definitions
+│
+├── config/
+│   └── visibox.conf            # Configuration file
+│
+└── client/
+    ├── visibox-cli             # CLI client untuk test/debug
+    └── libvisibox.h            # C client library header
+```
+
+---
+
+## 5. DATA STRUCTURES
+
+```c
+// ═══════════════════════════════════════
+// ID SYSTEM
+// ═══════════════════════════════════════
+
+typedef struct {
+    char *request_id;       // Dari AI agent (nullable → auto generate)
+    char response_id[16];   // Format: "res_XXXXXXXX"
+} VisiboxIds;
+
+// ═══════════════════════════════════════
+// OUTPUT BUFFER + PAGINATION
+// ═══════════════════════════════════════
+
+typedef enum {
+    VISIBOX_PAGE_NONE,      // Tidak ada pagination
+    VISIBOX_PAGE_LINES,     // Pagination per baris
+    VISIBOX_PAGE_BYTES      // Pagination per byte
+} PaginationMode;
+
+typedef struct {
+    // Full output buffer
+    char *buffer;
+    size_t buffer_size;
+    size_t buffer_capacity;
+
+    // Metadata
+    size_t total_lines;
+    size_t total_bytes;
+
+    // Pagination state
+    PaginationMode mode;
+    size_t page_size;
+    size_t current_offset_lines;
+    size_t current_offset_bytes;
+    char cursor[32];            // cursor untuk fetch page berikutnya
+    char prev_cursor[32];       // cursor untuk fetch page sebelumnya
+    bool has_next;
+    bool has_prev;
+    bool truncated;
+} OutputBuffer;
+
+// ═══════════════════════════════════════
+// INTERACTIVE SESSION
+// ═══════════════════════════════════════
+
+typedef enum {
+    SESSION_ACTIVE,
+    SESSION_WAITING_INPUT,
+    SESSION_CLOSED,
+    SESSION_ERROR,
+    SESSION_TIMEOUT
+} SessionStatus;
+
+typedef struct {
+    char session_id[16];        // Format: "sess_XXXXXXXX"
+    char *command;              // Command yang dijalankan
+    pid_t child_pid;
+    int pty_master_fd;          // Master side of PTY
+    int pty_slave_fd;           // Slave side of PTY
+
+    SessionStatus status;
+    time_t started_at;
+    time_t last_activity;
+
+    // Output buffer (circular ring buffer)
+    OutputBuffer *output_buffer;
+
+    // Stats
+    size_t total_input_sent;
+    size_t total_output_bytes;
+    int total_interactions;
+
+    // Read timeout
+    int read_timeout_ms;
+} Session;
+
+// ═══════════════════════════════════════
+// REQUEST / RESPONSE
+// ═══════════════════════════════════════
+
+typedef enum {
+    REQ_EXECUTE,            // Run command sekali jalan
+    REQ_SESSION_START,      // Start interactive session
+    REQ_SESSION_INPUT,      // Send input ke session
+    REQ_SESSION_READ,       // Baca output session (tanpa input)
+    REQ_SESSION_CLOSE,      // Close session
+    REQ_SESSION_LIST,       // List semua session aktif
+    REQ_FETCH_PAGE          // Ambil page berikutnya
+} RequestType;
+
+typedef struct {
+    // Identity
+    char *request_id;
+    RequestType type;
+
+    // For REQ_EXECUTE
+    char *command;
+    char *cwd;
+    char **env;
+
+    // For REQ_SESSION_*
+    char *session_id;
+    char *input;
+
+    // For REQ_FETCH_PAGE
+    char *reference_response_id;
+    char *cursor;
+
+    // Pagination options
+    PaginationMode page_mode;
+    size_t output_limit;        // 0 = default, SIZE_MAX = no limit
+
+    // Session options
+    int timeout_ms;
+    bool wait_for_prompt;
+    char *prompt_pattern;
+    bool graceful_close;
+    int close_signal;
+} VisiboxRequest;
+
+typedef struct {
+    // Identity
+    char *request_id;
+    char response_id[16];
+
+    // Type
+    RequestType type;
+
+    // Execution result
+    int exit_code;
+    long duration_ms;
+    char *started_at;
+    char *finished_at;
+
+    // Session result
+    char session_id[16];
+    SessionStatus session_status;
+    bool prompt_detected;
+
+    // Output
+    char *output;
+    size_t output_lines;
+    size_t output_bytes;
+    bool output_truncated;
+
+    // Pagination
+    bool has_pagination;
+    int current_page;
+    size_t page_size;
+    size_t total_lines;
+    size_t total_pages;
+    bool has_next;
+    bool has_prev;
+    char next_cursor[32];
+    char prev_cursor[32];
+
+    // Session list
+    Session **sessions;
+    int session_count;
+
+    // Error
+    int error_code;
+    char *error_message;
+} VisiboxResponse;
+```
+
+---
+
+## 6. MODIFIKASI CORE BASH
+
+### 6a. Output Capture (`execute_cmd.c`)
+
+```c
+// MODIFIKASI: wrap execution dengan output capture
+
+int visibox_execute_and_capture(VisiboxRequest *req, VisiboxResponse *res) {
+    // 1. Generate response ID
+    visibox_generate_id(res->response_id, "res_");
+
+    // 2. Setup output pipe
+    int pipefd[2];
+    pipe(pipefd);
+
+    // 3. Record start time
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    // 4. Execute command (original bash execution path)
+    pid_t child = fork();
+    if (child == 0) {
+        // Child: redirect stdout/stderr ke pipe
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[0]);
+        close(pipefd[1]);
+
+        // Jalankan command via original bash execute path
+        visibox_execute_original(req->command);
+        _exit(0);
+    }
+
+    // 5. Parent: capture output ke buffer
+    close(pipefd[1]);
+    OutputBuffer *buf = visibox_output_buffer_new();
+
+    char chunk[4096];
+    ssize_t n;
+    while ((n = read(pipefd[0], chunk, sizeof(chunk))) > 0) {
+        visibox_output_buffer_append(buf, chunk, n);
+
+        // Early termination jika output_limit tercapai
+        if (req->page_mode == VISIBOX_PAGE_LINES &&
+            buf->total_lines >= req->output_limit &&
+            req->output_limit > 0) {
+            buf->truncated = true;
+            // JANGAN break — biarkan child selesai, tapi stop buffering
+            // Sisa output tetap di pipe (akan di-drain)
+            visibox_drain_fd(pipefd[0]);
+            break;
+        }
+        if (req->page_mode == VISIBOX_PAGE_BYTES &&
+            buf->total_bytes >= req->output_limit &&
+            req->output_limit > 0) {
+            buf->truncated = true;
+            visibox_drain_fd(pipefd[0]);
+            break;
+        }
+    }
+    close(pipefd[0]);
+
+    // 6. Wait child, get exit code
+    int status;
+    waitpid(child, &status, 0);
+    res->exit_code = WEXITSTATUS(status);
+
+    // 7. Record timing
+    struct timespec end;
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    res->duration_ms = timespec_diff_ms(&start, &end);
+
+    // 8. Build pagination metadata
+    if (buf->truncated) {
+        visibox_paginator_build_metadata(buf, req, res);
+    }
+
+    // 9. Set output ke response
+    res->output = visibox_output_buffer_get_page(buf, 1, req->output_limit, req->page_mode);
+    res->output_lines = buf->total_lines;
+    res->output_bytes = buf->total_bytes;
+    res->output_truncated = buf->truncated;
+
+    // 10. Store in history untuk fetch_page nanti
+    visibox_response_store_add(res);
+
+    return 0;
+}
+```
+
+### 6b. Session Manager (`visibox_session.c`)
+
+```c
+// ═══════════════════════════════════════
+// SESSION MANAGER
+// ═══════════════════════════════════════
+
+#define MAX_SESSIONS 16
+
+typedef struct {
+    Session *sessions[MAX_SESSIONS];
+    int count;
+    pthread_mutex_t lock;
+} SessionManager;
+
+static SessionManager session_mgr = {0};
+
+// START SESSION
+Session* visibox_session_start(VisiboxRequest *req, VisiboxResponse *res) {
+    // 1. Allocate PTY pair
+    int pty_master, pty_slave;
+    char pty_name[256];
+
+    if (openpty(&pty_master, &pty_slave, pty_name, NULL, NULL) < 0) {
+        res->error_code = errno;
+        res->error_message = strdup("Failed to allocate PTY");
+        return NULL;
+    }
+
+    // 2. Fork child process
+    pid_t pid = fork();
+    if (pid == 0) {
+        // Child: attach ke PTY slave
+        close(pty_master);
+        login_tty(pty_slave);
+
+        // Set environment
+        if (req->env) {
+            for (char **e = req->env; *e; e++) putenv(*e);
+        }
+
+        // Change cwd
+        if (req->cwd) chdir(req->cwd);
+
+        // Execute command
+        execlp("/bin/sh", "sh", "-c", req->command, NULL);
+        _exit(127);
+    }
+
+    // 3. Parent: setup session
+    close(pty_slave);
+
+    Session *sess = calloc(1, sizeof(Session));
+    visibox_generate_id(sess->session_id, "sess_");
+    sess->child_pid = pid;
+    sess->pty_master_fd = pty_master;
+    sess->command = strdup(req->command);
+    sess->status = SESSION_ACTIVE;
+    sess->started_at = time(NULL);
+    sess->last_activity = time(NULL);
+    sess->read_timeout_ms = req->timeout_ms > 0 ? req->timeout_ms : 5000;
+    sess->output_buffer = visibox_output_buffer_new();
+
+    // 4. Set PTY non-blocking
+    fcntl(pty_master, F_SETFL, O_NONBLOCK);
+
+    // 5. Register session
+    pthread_mutex_lock(&session_mgr.lock);
+    session_mgr.sessions[session_mgr.count++] = sess;
+    pthread_mutex_unlock(&session_mgr.lock);
+
+    // 6. Read initial output
+    visibox_session_read_output(sess, req, res);
+
+    return sess;
+}
+
+// SEND INPUT + READ OUTPUT
+int visibox_session_input(VisiboxRequest *req, VisiboxResponse *res) {
+    Session *sess = visibox_session_find(req->session_id);
+    if (!sess) {
+        res->error_code = 404;
+        res->error_message = strdup("Session not found");
+        return -1;
+    }
+
+    // 1. Tulis input ke PTY master
+    ssize_t written = write(sess->pty_master_fd, req->input, strlen(req->input));
+    if (written < 0) {
+        res->error_code = errno;
+        res->error_message = strdup("Failed to write to session");
+        return -1;
+    }
+    sess->total_input_sent++;
+    sess->last_activity = time(NULL);
+
+    // 2. Tunggu dan baca output
+    visibox_session_read_output(sess, req, res);
+
+    return 0;
+}
+
+// NON-BLOCKING OUTPUT READER dengan PAGINATION
+int visibox_session_read_output(Session *sess, VisiboxRequest *req, VisiboxResponse *res) {
+    // Reset buffer untuk output baru
+    OutputBuffer *buf = sess->output_buffer;
+    visibox_output_buffer_reset(buf);
+
+    char chunk[4096];
+    struct timespec start, now;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    size_t target_lines = req->output_limit > 0 ? req->output_limit : 100;
+
+    while (1) {
+        // Cek timeout
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long elapsed_ms = timespec_diff_ms(&start, &now);
+        if (elapsed_ms >= sess->read_timeout_ms) break;
+
+        // Cek child masih hidup
+        if (visibox_session_is_dead(sess)) {
+            sess->status = SESSION_CLOSED;
+            break;
+        }
+
+        // Non-blocking read
+        ssize_t n = read(sess->pty_master_fd, chunk, sizeof(chunk));
+        if (n > 0) {
+            visibox_output_buffer_append(buf, chunk, n);
+            sess->total_output_bytes += n;
+
+            // Cek pagination limit
+            if (req->output_limit > 0 && buf->total_lines >= target_lines) {
+                buf->truncated = true;
+                break;
+            }
+
+            // Cek prompt pattern (kalau wait_for_prompt)
+            if (req->wait_for_prompt && req->prompt_pattern) {
+                if (visibox_detect_prompt(buf, req->prompt_pattern)) {
+                    res->prompt_detected = true;
+                    break;
+                }
+            }
+        } else if (n == 0) {
+            // EOF — process exited
+            sess->status = SESSION_CLOSED;
+            break;
+        } else {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // Tidak ada data, tunggu sebentar
+                usleep(10000); // 10ms
+                continue;
+            }
+            break;
+        }
+    }
+
+    // Build response
+    res->output = visibox_output_buffer_get_content(buf);
+    res->output_lines = buf->total_lines;
+    res->output_bytes = buf->total_bytes;
+    res->output_truncated = buf->truncated;
+    strncpy(res->session_id, sess->session_id, sizeof(res->session_id));
+    res->session_status = sess->status;
+
+    // Pagination metadata
+    if (buf->truncated) {
+        visibox_paginator_build_session_metadata(buf, req, res);
+    }
+
+    return 0;
+}
+
+// CLOSE SESSION
+int visibox_session_close(VisiboxRequest *req, VisiboxResponse *res) {
+    Session *sess = visibox_session_find(req->session_id);
+    if (!sess) {
+        res->error_code = 404;
+        res->error_message = strdup("Session not found");
+        return -1;
+    }
+
+    if (req->graceful_close) {
+        // Kirim SIGTERM, tunggu, lalu SIGKILL
+        kill(sess->child_pid, SIGTERM);
+        usleep(req->close_signal > 0 ? 3000000 : 1000000);
+        if (!visibox_session_is_dead(sess)) {
+            kill(sess->child_pid, SIGKILL);
+        }
+    } else {
+        kill(sess->child_pid, SIGKILL);
+    }
+
+    // Read final output
+    visibox_session_read_output(sess, req, res);
+
+    // Cleanup
+    close(sess->pty_master_fd);
+    waitpid(sess->child_pid, NULL, 0);
+    sess->status = SESSION_CLOSED;
+
+    // Remove from manager
+    pthread_mutex_lock(&session_mgr.lock);
+    visibox_session_remove(sess);
+    pthread_mutex_unlock(&session_mgr.lock);
+
+    return 0;
+}
+```
+
+---
+
+## 7. MODE OPERASI
+
+### Mode 1: Pipe Mode (Non-Interactive, untuk AI)
+
+```bash
+# AI agent pipe command ke visibox
+echo '{"request_id":"r1","type":"execute","command":"df -h"}' | ./visibox --pipe
+
+# Response langsung ke stdout
+{"request_id":"r1","response_id":"res_a1b2c3d4","type":"execute_result","exit_code":0,...}
+```
+
+### Mode 2: Daemon Mode (Socket/HTTP)
+
+```bash
+# Start daemon
+./visibox --daemon --socket=/tmp/visibox.sock
+
+# Client kirim request via unix socket
+echo '{"request_id":"r1","type":"execute","command":"df -h"}' | socat - UNIX-CONNECT:/tmp/visibox.sock
+```
+
+### Mode 3: REPL Mode (Interactive)
+
+```bash
+# Start interactive visibox shell
+./visibox --repl
+
+visibox [req_auto_001]> df -h
+{
+  "request_id": "req_auto_001",
+  "response_id": "res_f8e7d6c5",
+  "exit_code": 0,
+  "output": "Filesystem      Size  Used Avail Use% Mounted on\n...",
+  "pagination": null
+}
+
+visibox [req_auto_002]> .session start ssh user@server
+{
+  "request_id": "req_auto_002",
+  "response_id": "res_00000001",
+  "session_id": "sess_a1b2c3d4",
+  "status": "active",
+  "output": "password: "
+}
+
+visibox [req_auto_003]> .session input sess_a1b2c3d4 "mypass\n"
+{
+  "request_id": "req_auto_003",
+  "response_id": "res_00000002",
+  "session_id": "sess_a1b2c3d4",
+  "output": "Welcome...\nuser@server:~$ "
+}
+```
+
+---
+
+## 8. CONTOH FLOW LENGKAP AI AGENT
+
+```bash
+# ═══════════════════════════════════════════
+# AI AGENT: Investigasi masalah di server
+# ═══════════════════════════════════════════
+
+# 1. Cek disk usage (command sekali jalan, paginated)
+{"request_id":"r1","type":"execute","command":"df -h","options":{"output_limit":20}}
+→ {"request_id":"r1","response_id":"res_001","exit_code":0,
+   "output":"...","pagination":null}
+
+# 2. Cek log error (output besar, paginated)
+{"request_id":"r2","type":"execute","command":"journalctl -p err --since '24 hours ago'","options":{"output_limit":50}}
+→ {"request_id":"r2","response_id":"res_002","exit_code":0,
+   "output":"50 baris pertama...",
+   "output_truncated":true,
+   "pagination":{"current_page":1,"total_lines":847,"has_next":true,"next_cursor":"cur_xyz"}}
+
+# 3. Ambil page berikutnya
+{"request_id":"r3","type":"fetch_page","response_id":"res_002","cursor":"cur_xyz","options":{"output_limit":50}}
+→ {"request_id":"r3","response_id":"res_003","output":"baris 51-100...",...}
+
+# 4. SSH ke server untuk investigasi lebih lanjut (interactive session)
+{"request_id":"r4","type":"session_start","command":"ssh admin@prod-server","options":{"timeout_ms":10000,"output_limit":20}}
+→ {"request_id":"r4","response_id":"res_004","session_id":"sess_x1",
+   "status":"active","output":"admin@prod-server's password: "}
+
+# 5. Kirim password
+{"request_id":"r5","type":"session_input","session_id":"sess_x1","input":"secret123\n","options":{"wait_for_prompt":true,"prompt_pattern":"\\$\\s*$","timeout_ms":10000,"output_limit":30}}
+→ {"request_id":"r5","response_id":"res_005","session_id":"sess_x1",
+   "output":"Welcome...\nadmin@server:~$ ","prompt_detected":true}
+
+# 6. Jalankan perintah di remote server via session
+{"request_id":"r6","type":"session_input","session_id":"sess_x1","input":"du -sh /var/log/* | sort -rh | head -20\n","options":{"wait_for_prompt":true,"output_limit":25}}
+→ {"request_id":"r6","response_id":"res_006","session_id":"sess_x1",
+   "output":"2.1G\t/var/log/journal\n1.2G\t/var/log/syslog\n...","prompt_detected":true}
+
+# 7. Restart service
+{"request_id":"r7","type":"session_input","session_id":"sess_x1","input":"sudo systemctl restart nginx\n","options":{"wait_for_prompt":true,"output_limit":10}}
+→ {"request_id":"r7","response_id":"res_007","session_id":"sess_x1",
+   "output":"[sudo] password for admin: "}
+
+# 8. Kirim password lagi
+{"request_id":"r8","type":"session_input","session_id":"sess_x1","input":"secret123\n","options":{"wait_for_prompt":true,"output_limit":10}}
+→ {"request_id":"r8","response_id":"res_008","session_id":"sess_x1",
+   "output":"admin@server:~$ ","prompt_detected":true}
+
+# 9. Tutup session
+{"request_id":"r9","type":"session_close","session_id":"sess_x1","options":{"graceful":true}}
+→ {"request_id":"r9","response_id":"res_009","type":"session_closed",
+   "final_output":"Connection to prod-server closed.\n","session_duration_ms":45000}
+```
+
+---
+
+## 9. ROADMAP
+
+```
+FASE 1: CORE (Minggu 1-4)
+├── Fork bash + build system
+├── Command ID system (request_id + response_id)
+├── Output capture + buffer engine
+├── Output pagination (lines mode + bytes mode)
+├── Cursor-based page fetching
+├── Pipe mode (echo JSON | visibox)
+└── Response history ring buffer (untuk fetch_page)
+
+FASE 2: SESSIONS (Minggu 5-8)
+├── PTY session manager
+├── session_start / session_input / session_read / session_close
+├── Non-blocking I/O multiplexing (select/poll)
+├── Prompt detection (regex match)
+├── Session pagination (output_limit per read)
+├── Session list + status
+└── Graceful close + signal handling
+
+FASE 3: API & INTERFACE (Minggu 9-11)
+├── REPL mode (interactive visibox shell)
+├── Unix socket daemon mode
+├── HTTP API mode
+├── CLI client (visibox-cli)
+├── Connection pooling untuk daemon
+└── Concurrent session handling (epoll)
+
+FASE 4: POLISH (Minggu 12)
+├── Error handling & edge cases
+├── Auto-cleanup stale sessions
+├── Session timeout
+├── Memory management (buffer limits)
+├── Documentation
+└── Basic test suite
+```
+
+---
+
+Mau saya dalamkan bagian mana? Misalnya: implementasi PTY session multiplexing, pagination engine, atau desain JSON protocol lengkap?
