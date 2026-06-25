@@ -1,0 +1,17 @@
+[2026-06-25 02:47:04] [INFO] ══════════════════════════════════════════════════
+[2026-06-25 02:47:04] [INFO] WATCHDOG STARTED  (PID 1232)
+[2026-06-25 02:47:04] [INFO] Guardian script: /home/z/my-project/.guardian/guardian.sh
+[2026-06-25 02:47:04] [INFO] Check interval:  3s
+[2026-06-25 02:47:04] [INFO] ══════════════════════════════════════════════════
+[2026-06-25 02:47:04] [WARN] Guardian PID file missing.
+[2026-06-25 02:47:06] [RESTORE] ✓ Guardian resurrected (new PID 1256)
+[2026-06-25 02:47:40] [INFO] ══════════════════════════════════════════════════
+[2026-06-25 02:47:40] [INFO] WATCHDOG STARTED  (PID 1545)
+[2026-06-25 02:47:40] [INFO] Guardian script: /home/z/my-project/.guardian/guardian.sh
+[2026-06-25 02:47:40] [INFO] Check interval:  3s
+[2026-06-25 02:47:40] [INFO] ══════════════════════════════════════════════════
+[2026-06-25 02:47:40] [WARN] Guardian PID file missing.
+[2026-06-25 02:47:42] [RESTORE] ✓ Guardian resurrected (new PID 1569)
+/home/z/my-project/.guardian/watchdog.sh: line 136:  1569 Killed                  nohup bash "$GUARDIAN_SCRIPT" >> "${GUARDIAN_DIR}/guardian.out" 2>&1
+[2026-06-25 02:48:12] [WARN] Guardian PID 1569 is dead.
+[2026-06-25 02:48:14] [RESTORE] ✓ Guardian resurrected (new PID 1854)

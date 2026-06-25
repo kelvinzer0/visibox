@@ -1,0 +1,3 @@
+# SOUL.md
+
+<!-- Isi nanti -->

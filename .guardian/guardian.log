@@ -1,0 +1,23 @@
+[2026-06-25 02:47:05] [INFO] ══════════════════════════════════════════════════
+[2026-06-25 02:47:05] [INFO] GUARDIAN STARTED  (PID 1256)
+[2026-06-25 02:47:05] [INFO] Watching: AGENTS.md SOUL.md
+[2026-06-25 02:47:05] [INFO] Poll interval: 2s
+[2026-06-25 02:47:05] [INFO] ══════════════════════════════════════════════════
+[2026-06-25 02:47:41] [INFO] ══════════════════════════════════════════════════
+[2026-06-25 02:47:41] [INFO] GUARDIAN STARTED  (PID 1569)
+[2026-06-25 02:47:41] [INFO] Watching: AGENTS.md SOUL.md
+[2026-06-25 02:47:41] [INFO] Poll interval: 2s
+[2026-06-25 02:47:41] [INFO] ══════════════════════════════════════════════════
+[2026-06-25 02:47:51] [ALERT] ⚠ TAMPER DETECTED: AGENTS.md (160
+0 lines changed)
+[2026-06-25 02:47:51] [ALERT]   Expected hash: 4be9b334754506773c32bcd55c99f64b145dba0e9163275fa3db54d83a64415d
+[2026-06-25 02:47:51] [ALERT]   Current hash:  d35896bbdb4d3b1bc0058271e427c2ca79f09f3e17c0410ea40572b969b9731d
+[2026-06-25 02:47:51] [ALERT]   Evidence saved: /home/z/my-project/.guardian/tamper_evidence/AGENTS.md.tampered.1782355671
+[2026-06-25 02:47:51] [RESTORE] ✓ AGENTS.md restored to golden state (hash verified)
+[2026-06-25 02:48:01] [ALERT] ⚠ FILE DELETED: SOUL.md — restoring from golden backup
+[2026-06-25 02:48:01] [RESTORE] ✓ SOUL.md restored (was deleted)
+[2026-06-25 02:48:13] [INFO] ══════════════════════════════════════════════════
+[2026-06-25 02:48:13] [INFO] GUARDIAN STARTED  (PID 1854)
+[2026-06-25 02:48:13] [INFO] Watching: AGENTS.md SOUL.md
+[2026-06-25 02:48:13] [INFO] Poll interval: 2s
+[2026-06-25 02:48:13] [INFO] ══════════════════════════════════════════════════
