@@ -500,7 +500,7 @@ HSOURCES = shell.h flags.h trap.h hashcmd.h hashlib.h jobs.h builtins.h \
 	   execute_cmd.h parser.h pathexp.h pathnames.h pcomplete.h assoc.h \
 	   $(BASHINCFILES)
 
-SOURCES	 = $(CSOURCES) $(HSOURCES) $(BUILTIN_DEFS)
+SOURCES	 = $(CSOURCES) $(HSOURCES) $(BUILTIN_DEFS) $(VISIBOX_SOURCES)
 
 # headers in top-level source directory that get installed by install-headers
 INSTALLED_HEADERS = shell.h bashjmp.h command.h syntax.h general.h error.h \
@@ -539,13 +539,15 @@ OBJECTS	 = shell.o eval.o y.tab.o general.o make_cmd.o print_cmd.o \
 	   bashline.o $(SIGLIST_O) list.o stringlib.o locale.o findcmd.o redir.o \
 	   pcomplete.o pcomplib.o syntax.o xmalloc.o $(SIGNAMES_O)
 
-VISIBOX_OBJS = shell/visibox_core.o shell/visibox_id.o shell/visibox_paginator.o \
-	shell/visibox_linenums.o shell/visibox_search.o shell/visibox_store.o \
-	shell/visibox_protocol.o shell/visibox_dispatch.o shell/visibox_session.o \
-	shell/visibox_session_pty.o shell/visibox_eventloop.o shell/visibox_prompt.o \
-	shell/visibox_repl.o shell/visibox_daemon.o shell/visibox_config_loader.o
+VISIBOX_SOURCES = $(addprefix shell/,visibox_core.c visibox_id.c visibox_paginator.c \
+	visibox_linenums.c visibox_search.c visibox_store.c \
+	visibox_protocol.c visibox_dispatch.c visibox_session.c \
+	visibox_session_pty.c visibox_eventloop.c visibox_prompt.c \
+	visibox_repl.c visibox_daemon.c visibox_config_loader.c)
 
-# Where the source code of the shell builtins resides.
+VISIBOX_OBJS = $(VISIBOX_SOURCES:.c=.o)
+
+# Where# Where the source code of the shell builtins resides.
 BUILTIN_SRCDIR=$(srcdir)/builtins
 DEFSRC=$(BUILTIN_SRCDIR)
 BUILTIN_ABSSRC=${topdir}/builtins
