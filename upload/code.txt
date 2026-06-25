@@ -1,0 +1,33 @@
+FASE 1: CORE (Minggu 1-4)
+├── Fork bash + build system
+├── Command ID system (request_id + response_id)
+├── Output capture + buffer engine
+├── Output pagination (lines mode + bytes mode)
+├── Cursor-based page fetching
+├── Pipe mode (echo JSON | visibox)
+└── Response history ring buffer (untuk fetch_page)
+
+FASE 2: SESSIONS (Minggu 5-8)
+├── PTY session manager
+├── session_start / session_input / session_read / session_close
+├── Non-blocking I/O multiplexing (select/poll)
+├── Prompt detection (regex match)
+├── Session pagination (output_limit per read)
+├── Session list + status
+└── Graceful close + signal handling
+
+FASE 3: API & INTERFACE (Minggu 9-11)
+├── REPL mode (interactive visibox shell)
+├── Unix socket daemon mode
+├── HTTP API mode
+├── CLI client (visibox-cli)
+├── Connection pooling untuk daemon
+└── Concurrent session handling (epoll)
+
+FASE 4: POLISH (Minggu 12)
+├── Error handling & edge cases
+├── Auto-cleanup stale sessions
+├── Session timeout
+├── Memory management (buffer limits)
+├── Documentation
+└── Basic test suite
