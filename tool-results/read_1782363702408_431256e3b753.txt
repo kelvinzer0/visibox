@@ -1,0 +1,1105 @@
+     1→# VisiBox — PRD v3
+     2→## Shell Execution Engine untuk AI Agent
+     3→### Dokumen internal — panduan implementasi
+     4→
+     5→---
+     6→
+     7→## 0. RINGKASAN EKSEKUTIF
+     8→
+     9→VisiBox adalah fork bash yang menambahkan 5 kapabilitas untuk dikendalikan AI agent lewat protokol JSON:
+    10→
+    11→1. **ID system** — setiap operasi punya `request_id` (milik caller) dan `response_id` (milik VisiBox), untuk audit dan referensi silang.
+    12→2. **Interactive session control** — AI bisa spawn proses interaktif (ssh, python, mysql), kirim input, baca output, kapan saja, tanpa proses itu mati di antara request.
+    13→3. **Output pagination** — output besar dipotong per halaman dengan cursor, supaya AI tidak overload context window.
+    14→4. **Line numbers** — setiap baris output shell dilengkapi nomor baris (seperti code editor), memudahkan AI merujuk baris spesifik saat analisis output.
+    15→5. **Keyword-based pagination jump** — AI bisa mencari keyword di seluruh output dan langsung loncat ke halaman pagination yang mengandung keyword tersebut, tanpa harus scroll manual halaman per halaman.
+    16→
+    17→Dokumen ini adalah **versi v3** yang membangun di atas v2 (rewrite). Enam masalah desain di draft v1 sudah diperbaiki di v2 — lihat §1 untuk daftar lengkap apa yang berubah dari v1. Fitur baru v3 (#4 dan #5) dijelaskan di §1.3.
+    18→
+    19→---
+    20→
+    21→## 1. APA YANG BERUBAH DARI VERSI SEBELUMNYA
+    22→
+    23→### 1.1 Perubahan v1 → v2
+    24→
+    25→| # | Masalah di v1 | Perbaikan di v2 |
+    26→|---|---|---|
+    27→| 1 | `execute` fork ulang shell baru per command → `cd`, `export` tidak persist antar request | Command non-session dieksekusi di **proses bash induk yang sama**, lewat jalur eksekusi asli bash. Shell state (cwd, env, alias) persist secara native, sama seperti shell interaktif biasa. |
+    28→| 2 | Truncation tetap drain seluruh output dari pipe → tidak menghemat compute, hanya menghemat token | Didokumentasikan eksplisit: `output_limit` adalah **proteksi token**, bukan proteksi compute. Ditambahkan rekomendasi command-level limiting (`head`, `LIMIT`) sebagai tanggung jawab AI agent, bukan VisiBox. |
+    29→| 3 | Response history ring buffer tanpa kebijakan retensi/limit memori | Ring buffer punya **kapasitas eksplisit** (jumlah entri + total bytes), kebijakan eviction (FIFO), dan response error standar (`ERR_RESPONSE_EXPIRED`) kalau `fetch_page` mengacu ke response yang sudah di-evict. |
+    30→| 4 | PTY read loop pakai busy-poll `usleep(10000)` per session → tidak scale ke concurrent session | Diganti `poll()`/`epoll` dari Fase 2 (bukan ditunda ke Fase 3). Satu event loop memantau semua PTY fd sekaligus. Tidak ada busy-wait. |
+    31→| 5 | Prompt detection regex rapuh terhadap ANSI escape code | Output PTY di-strip ANSI **sebelum** regex match (raw output tetap disimpan untuk ditampilkan ke AI). |
+    32→| 6 | Tidak jelas kapan AI harus pakai `execute` vs `session_start` | Ditambahkan aturan keputusan eksplisit di §3, dengan tabel kapan pakai yang mana. |
+    33→
+    34→### 1.2 Perubahan v2 → v3 (BARU)
+    35→
+    36→| # | Fitur Baru v3 | Deskripsi |
+    37→|---|---|---|
+    38→| 7 | **Line numbers di output** | Setiap baris output shell diberi nomor baris absolut (berdasarkan posisi di keseluruhan output, bukan per-halaman). AI bisa merujuk "baris 42" dan langsung tahu itu baris ke-42 dari total output. Nomor baris konsisten di semua halaman — halaman 2 tidak mulai dari 1 lagi, melainkan dari `page_size + 1`. |
+    39→| 8 | **Keyword-based pagination jump** (`search_jump`) | Request type baru yang memungkinkan AI mencari keyword di seluruh output (termasuk halaman yang belum di-fetch), dan langsung menerima halaman yang mengandung keyword beserta konteks sekitarnya. Menghilangkan kebutuhan untuk scroll halaman per halaman saat mencari sesuatu di output besar. |
+    40→
+    41→---
+    42→
+    43→## 2. PRINSIP DESAIN
+    44→
+    45→Ini bukan sekadar daftar fitur — ini aturan yang dipegang konsisten di seluruh implementasi, supaya saat coding solo nanti tidak bikin keputusan ad-hoc yang saling kontradiksi.
+    46→
+    47→**P1 — Shell state itu sakral.**
+    48→Command non-interaktif (`execute`) HARUS berjalan di proses bash yang sama, bukan subprocess terpisah. Kalau ini dilanggar, seluruh value proposition "AI bisa `cd` lalu `ls`" hilang.
+    49→
+    50→**P2 — Pagination melindungi token, bukan compute.**
+    51→VisiBox tidak menjanjikan command berhenti lebih cepat karena `output_limit` kecil. Itu tanggung jawab command itu sendiri (`head`, `LIMIT N`, dll). Dokumentasikan ini ke pengguna API supaya ekspektasi benar.
+    52→
+    53→**P3 — Tidak ada busy-wait di hot path.**
+    54→Semua I/O menunggu (PTY read, socket read) lewat `poll()`/`epoll`, bukan sleep-loop. Ini bukan optimisasi prematur — ini syarat supaya Fase 2 tidak perlu rewrite di Fase 3.
+    55→
+    56→**P4 — Semua resource punya batas eksplisit dan kebijakan eviction.**
+    57→Ring buffer response, jumlah session aktif, ukuran output buffer per session — semua punya angka konkret di config, bukan "in-memory, unbounded" yang baru ditemukan masalahnya saat production.
+    58→
+    59→**P5 — Ambiguitas protokol = bug spec, bukan bug implementasi.**
+    60→Kalau ada pertanyaan "request macam apa yang harus dikirim AI di situasi X" yang tidak terjawab oleh dokumen ini, itu dianggap PRD belum lengkap — bukan sesuatu yang "akan jelas saat coding". Setiap request type punya kontrak lengkap di §5.
+    61→
+    62→**P6 — Nomor baris itu absolut dan konsisten.** *(BARU v3)*
+    63→Line numbers merepresentasikan posisi baris di keseluruhan output, bukan posisi relatif per halaman. Halaman 1 = baris 1–100, halaman 2 = baris 101–200, dst. Ini memungkinkan AI merujuk baris spesifik secara unik tanpa ambigu "halaman berapa, baris ke berapa".
+    64→
+    65→**P7 — Pencarian harus cepat tanpa fetch seluruh output.** *(BARU v3)*
+    66→`search_jump` harus bisa mencari keyword tanpa mengirim seluruh output ke AI. Implementasi pencarian dilakukan server-side pada buffered output, bukan client-side. AI hanya menerima halaman yang relevan.
+    67→
+    68→---
+    69→
+    70→## 3. KAPAN PAKAI `execute` VS `session_start`
+    71→
+    72→Ini keputusan yang sering diabaikan di desain serupa, padahal krusial buat AI agent supaya tidak salah pilih jalur.
+    73→
+    74→| Situasi | Jalur | Alasan |
+    75→|---|---|---|
+    76→| Command selesai dengan sendirinya, exit code jelas (`ls`, `df -h`, `git status`) | `execute` | Tidak butuh state interaktif lintas-command selain shell env (yang otomatis persist via P1). |
+    77→| Command butuh input interaktif (password, konfirmasi `y/n`, REPL) | `session_start` + `session_input` | `execute` tidak punya jalur untuk mengirim input setelah command jalan. |
+    78→| Command yang sengaja tidak pernah exit (`tail -f`, server foreground, `watch`) | `session_start` | `execute` akan menunggu exit yang tidak pernah terjadi → harus timeout-kill, yang merusak semantik "command selesai, ini hasilnya". |
+    79→| Butuh banyak command berurutan dengan koneksi/proses yang sama (ssh lalu beberapa command remote) | `session_start` sekali, lalu beberapa `session_input` | Membuka ssh baru per command = re-auth tiap kali, tidak efisien, dan kalau session punya state (mysql `USE db;`) akan hilang. |
+    80→| Command lokal sederhana tapi dipanggil bertubi-tubi dengan dependency pada `cwd`/env yang diubah command sebelumnya | `execute` (berkat P1, ini AMAN — cwd persist otomatis) | Tidak perlu session untuk ini; ini justru kasus yang dulu rusak di v1. |
+    81→
+    82→Aturan ringkas untuk AI agent: **kalau command itu sendiri akan exit dan tidak butuh input tambahan, pakai `execute`. Selain itu, `session_start`.**
+    83→
+    84→---
+    85→
+    86→## 4. ARSITEKTUR
+    87→
+    88→### 4.1 Prinsip struktural
+    89→
+    90→VisiBox = bash source + lapisan tambahan yang **hook ke jalur eksekusi asli**, bukan menggantikannya dengan subprocess wrapper. Ini beda penting dari "shell wrapper" generik (seperti banyak agentic-shell tool yang cuma `subprocess.run()` di Python) — di sini kita betul-betul masuk ke source bash.
+    91→
+    92→```
+    93→visibox/
+    94→├── (bash source, fork dari upstream GNU bash)
+    95→│
+    96→├── shell/
+    97→│   ├── visibox_core.c           # Entry point, mode switcher (pipe/daemon/repl)
+    98→│   ├── visibox_id.c             # ID generator & validasi
+    99→│   ├── visibox_session.c        # Session manager: lifecycle, registry
+   100→│   ├── visibox_session_pty.c    # PTY spawn (openpty, login_tty, fork+exec)
+   101→│   ├── visibox_eventloop.c      # epoll/poll multiplexer — SATU loop untuk semua session fd
+   102→│   ├── visibox_prompt.c         # ANSI strip + regex prompt detection
+   103→│   ├── visibox_paginator.c      # Output buffer + pagination + cursor encoding
+   104→│   ├── visibox_linenums.c       # [BARU v3] Line number formatting & injection
+   105→│   ├── visibox_search.c         # [BARU v3] Keyword search engine pada output buffer
+   106→│   ├── visibox_store.c          # Response history ring buffer (bounded, evicting)
+   107→│   ├── visibox_protocol.c       # JSON parse/serialize, request validation
+   108→│   ├── visibox_dispatch.c       # Routing: request type → handler
+   109→│   │
+   110→│   ├── execute_cmd.c            # MODIFIED: hook output capture ke jalur asli (TIDAK fork shell baru)
+   111→│   ├── eval.c                   # MODIFIED: titip dispatch hook setelah command line di-parse
+   112→│   └── input.c                  # MODIFIED: baca dari stdin/socket sesuai mode
+   113→│
+   114→├── include/
+   115→│   └── visibox.h                # Semua struct & deklarasi (lihat §6)
+   116→│
+   117→├── config/
+   118→│   └── visibox.conf             # Lihat §7
+   119→│
+   120→├── client/
+   121→│   ├── visibox-cli              # CLI client untuk test/debug manual
+   122→│   └── libvisibox.h             # Client library header (opsional, Fase 3)
+   123→│
+   124→└── tests/
+   125→    ├── test_execute_state.c     # Verifikasi cwd/env persist antar execute (regression test untuk P1)
+   126→    ├── test_pagination.c
+   127→    ├── test_linenums.c          # [BARU v3] Verifikasi line numbers konsisten antar halaman
+   128→    ├── test_search_jump.c       # [BARU v3] Verifikasi keyword search & page jump
+   129→    ├── test_session_lifecycle.c
+   130→    └── test_eventloop_concurrent.c
+   131→```
+   132→
+   133→### 4.2 Bagaimana `execute` TIDAK fork shell baru (perbaikan masalah #1)
+   134→
+   135→Ini bagian paling penting yang berubah dari v1. Penjelasan mekanismenya:
+   136→
+   137→**Yang SALAH (v1):** parent fork() → child jalankan command via `visibox_execute_original()` di proses terpisah → exit. Command seperti `cd` cuma mengubah cwd di child, hilang begitu child exit. Parent (proses VisiBox utama) cwd-nya tidak pernah berubah.
+   138→
+   139→**Yang BENAR (v2+):** Hook ditempatkan di `eval.c`, **setelah** bash parse command line jadi command struct, tapi **sebelum/sesudah** bash menjalankannya lewat jalur normal (`execute_command()` bash asli). Untuk command yang sudah `fork` secara native oleh bash (kebanyakan command eksternal memang fork di bash), kita tidak menambah fork lagi — kita hanya:
+   140→
+   141→1. Redirect fd 1/2 proses VisiBox **sementara** (lewat `dup2` + simpan fd asli) sebelum memanggil jalur eksekusi bash asli.
+   142→2. Panggil `execute_command()` bash asli — bash sendiri yang menentukan apakah perlu fork (command eksternal) atau tidak (builtin seperti `cd`, `export`).
+   143→3. Setelah command selesai, restore fd 1/2 ke semula.
+   144→4. Buffer yang menampung output adalah pipe yang dibaca di proses VisiBox utama sendiri (bukan child terpisah) — karena fd 1/2 sudah diarahkan ke pipe itu selama command jalan.
+   145→
+   146→Konsekuensi: builtin (`cd`, `export`, `alias`, `unset`) memodifikasi state proses VisiBox utama secara langsung, persis seperti shell interaktif normal. Command eksternal tetap fork (seperti biasanya di bash), tapi itu fork yang sama yang sudah dilakukan bash secara native — bukan fork tambahan dari VisiBox.
+   147→
+   148→```c
+   149→// execute_cmd.c — MODIFIED (v2+, bukan v1)
+   150→int visibox_execute_and_capture(VisiboxRequest *req, VisiboxResponse *res) {
+   151→    visibox_generate_id(res->response_id, "res_");
+   152→
+   153→    int pipefd[2];
+   154→    pipe(pipefd);
+   155→
+   156→    int saved_stdout = dup(STDOUT_FILENO);
+   157→    int saved_stderr = dup(STDERR_FILENO);
+   158→    dup2(pipefd[1], STDOUT_FILENO);
+   159→    dup2(pipefd[1], STDERR_FILENO);
+   160→    close(pipefd[1]);
+   161→
+   162→    // PENTING: set pipe read-end non-blocking SEBELUM eksekusi,
+   163→    // supaya kita bisa membaca progresif sambil command masih jalan
+   164→    // (perlu untuk early-truncation tanpa deadlock pada command yang
+   165→    // outputnya lebih besar dari pipe buffer kernel, biasanya 64KB)
+   166→    fcntl(pipefd[0], F_SETFL, O_NONBLOCK);
+   167→
+   168→    struct timespec start, end;
+   169→    clock_gettime(CLOCK_MONOTONIC, &start);
+   170→
+   171→    // INI jalur eksekusi BASH ASLI — bukan fork+exec buatan VisiBox.
+   172→    // Builtin (cd, export, dll) jalan langsung di proses ini.
+   173→    // Command eksternal: bash sendiri yang fork, seperti perilaku normal.
+   174→    int exit_code = execute_command(req->parsed_command);  // fungsi bash native
+   175→
+   176→    clock_gettime(CLOCK_MONOTONIC, &end);
+   177→
+   178→    // Restore fd SEGERA setelah command selesai — sebelum baca pipe,
+   179→    // supaya VisiBox bisa nulis log/error ke stdout asli kalau perlu
+   180→    dup2(saved_stdout, STDOUT_FILENO);
+   181→    dup2(saved_stderr, STDERR_FILENO);
+   182→    close(saved_stdout);
+   183→    close(saved_stderr);
+   184→
+   185→    OutputBuffer *buf = visibox_output_buffer_new();
+   186→    visibox_drain_pipe_with_limit(pipefd[0], buf, req->output_limit, req->page_mode);
+   187→    close(pipefd[0]);
+   188→
+   189→    res->exit_code = exit_code;
+   190→    res->duration_ms = timespec_diff_ms(&start, &end);
+   191→    res->output = visibox_output_buffer_get_page(buf, 1, req->output_limit, req->page_mode);
+   192→    res->output_lines = buf->total_lines;
+   193→    res->output_bytes = buf->total_bytes;
+   194→    res->output_truncated = buf->truncated;
+   195→
+   196→    // [BARU v3] Format line numbers jika diminta
+   197→    if (req->options.line_numbers) {
+   198→        visibox_linenums_inject(res->output, 1, req->output_limit, buf->total_lines);
+   199→        res->line_numbers = true;
+   200→        res->line_start = 1;
+   201→        res->line_end = visibox_min(req->output_limit, buf->total_lines);
+   202→    }
+   203→
+   204→    if (buf->truncated) {
+   205→        visibox_paginator_build_metadata(buf, req, res);
+   206→    }
+   207→
+   208→    visibox_response_store_add(res, buf);  // simpan buf untuk fetch_page/search_jump nanti
+   209→    return 0;
+   210→}
+   211→```
+   212→
+   213→**Catatan implementasi penting:** `execute_command()` adalah fungsi internal bash (nama sebenarnya bisa berbeda tergantung versi source — cek `execute_cmd.c` upstream bash, biasanya `execute_command()` atau `execute_command_internal()`). Tugas pertama di Fase 1 adalah memetakan fungsi mana persisnya di source yang dipakai, dan memverifikasi lewat eksperimen kecil bahwa `cd` di dalam pemanggilan ini benar-benar mengubah `getcwd()` proses, bukan cuma child.
+   214→
+   215→### 4.3 Drain dengan limit — kebijakan diperjelas (perbaikan masalah #2)
+   216→
+   217→```c
+   218→// visibox_paginator.c
+   219→void visibox_drain_pipe_with_limit(int fd, OutputBuffer *buf,
+   220→                                     size_t limit, PaginationMode mode) {
+   221→    char chunk[4096];
+   222→    ssize_t n;
+   223→    bool limit_hit = false;
+   224→
+   225→    while (1) {
+   226→        n = read(fd, chunk, sizeof(chunk));
+   227→        if (n > 0) {
+   228→            if (!limit_hit) {
+   229→                visibox_output_buffer_append(buf, chunk, n);
+   230→                if (limit > 0 &&
+   231→                    ((mode == VISIBOX_PAGE_LINES && buf->total_lines >= limit) ||
+   232→                     (mode == VISIBOX_PAGE_BYTES && buf->total_bytes >= limit))) {
+   233→                    buf->truncated = true;
+   234→                    limit_hit = true;
+   235→                    // CATATAN: kita TERUS membaca fd sampai EOF untuk mencegah
+   236→                    // proses penulis (command) blok menulis ke pipe penuh,
+   237→                    // tapi BERHENTI menyimpan ke buffer (buang chunk).
+   238→                    // Ini TIDAK menghemat waktu eksekusi command — command
+   239→                    // tetap jalan sampai selesai. Ini HANYA mencegah AI
+   240→                    // menerima output raksasa. Lihat P2 di §2.
+   241→                }
+   242→            }
+   243→            // kalau limit_hit, chunk dibuang — tapi total_lines/total_bytes
+   244→            // TETAP dihitung di luar buffer kalau include_total=true di config,
+   245→            // supaya pagination metadata (total_lines) akurat
+   246→            if (limit_hit) {
+   247→                visibox_output_buffer_count_only(buf, chunk, n);
+   248→            }
+   249→        } else if (n == 0) {
+   250→            break;  // EOF, command selesai menulis
+   251→        } else {
+   252→            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+   253→                struct pollfd pfd = { .fd = fd, .events = POLLIN };
+   254→                poll(&pfd, 1, -1);  // tunggu data tanpa busy-wait
+   255→                continue;
+   256→            }
+   257→            break;  // error lain, stop
+   258→        }
+   259→    }
+   260→}
+   261→```
+   262→
+   263→---
+   264→
+   265→## 5. FITUR BARU v3 — DETAIL TEKNIS
+   266→
+   267→### 5A. LINE NUMBERS DI OUTPUT
+   268→
+   269→#### 5A.1 Konsep
+   270→
+   271→Setiap baris output shell yang dikembalikan ke AI bisa dilengkapi nomor barit absolut. Nomor baris ini merepresentasikan posisi baris di **keseluruhan output** command, bukan posisi relatif di halaman saat ini.
+   272→
+   273→**Contoh output `ls -la` dengan 100 file, page_size=10, line_numbers=true:**
+   274→
+   275→Halaman 1:
+   276→```
+   277→  1 │ total 504
+   278→  2 │ drwxr-xr-x  2 root root  4096 Jun 25 10:00 .
+   279→  3 │ drwxr-xr-x  3 root root  4096 Jun 25 09:55 ..
+   280→  4 │ -rw-r--r--  1 root root  8192 Jun 25 10:00 file1.txt
+   281→  5 │ -rw-r--r--  1 root root  4096 Jun 25 10:00 file2.txt
+   282→  6 │ -rw-r--r--  1 root root  4096 Jun 25 10:00 file3.txt
+   283→  7 │ -rw-r--r--  1 root root  4096 Jun 25 10:00 file4.txt
+   284→  8 │ -rw-r--r--  1 root root  4096 Jun 25 10:00 file5.txt
+   285→  9 │ -rw-r--r--  1 root root  4096 Jun 25 10:00 file6.txt
+   286→ 10 │ -rw-r--r--  1 root root  4096 Jun 25 10:00 file7.txt
+   287→```
+   288→
+   289→Halaman 2 (`fetch_page` page=2):
+   290→```
+   291→ 11 │ -rw-r--r--  1 root root  4096 Jun 25 10:00 file8.txt
+   292→ 12 │ -rw-r--r--  1 root root  4096 Jun 25 10:00 file9.txt
+   293→ 13 │ -rw-r--r--  1 root root  4096 Jun 25 10:00 file10.txt
+   294→ ...
+   295→ 20 │ -rw-r--r--  1 root root  4096 Jun 25 10:00 file17.txt
+   296→```
+   297→
+   298→**Key insight:** Baris 1-10 di halaman 1, baris 11-20 di halaman 2. AI bisa merujuk "baris 15" dan itu unik di seluruh output — tidak ambigu "halaman 2 baris 5".
+   299→
+   300→#### 5A.2 Format Line Number
+   301→
+   302→```
+   303→{right-aligned number, width = digit_count(total_lines)} │ {content}
+   304→```
+   305→
+   306→- Pemisah default: ` │ ` (space, box-drawing vertical line U+2502, space)
+   307→- Lebar kolom nomor barit otomatis menyesuaikan jumlah digit total_lines
+   308→  - 1-9 baris → width 1
+   309→  - 10-99 baris → width 2
+   310→  - 100-999 baris → width 3
+   311→  - dst.
+   312→- Right-aligned, padded dengan spasi
+   313→- Baris kosong juga dapat nomor baris (kontennya string kosong setelah separator)
+   314→
+   315→#### 5A.3 Penggunaan di Protokol
+   316→
+   317→Line numbers dikontrol via field `options.line_numbers` (boolean, default: `false`).
+   318→
+   319→**`execute` dengan line numbers:**
+   320→```json
+   321→{
+   322→  "request_id": "req_001",
+   323→  "type": "execute",
+   324→  "command": "find /var/log -name '*.log' -type f",
+   325→  "options": {
+   326→    "output_limit": 50,
+   327→    "output_unit": "lines",
+   328→    "line_numbers": true
+   329→  }
+   330→}
+   331→```
+   332→
+   333→**Response:**
+   334→```json
+   335→{
+   336→  "request_id": "req_001",
+   337→  "response_id": "res_xxxxxxxx",
+   338→  "type": "execute_result",
+   339→  "exit_code": 0,
+   340→  "output": "  1 │ /var/log/syslog\n  2 │ /var/log/auth.log\n  3 │ /var/log/kern.log\n...",
+   341→  "output_lines": 127,
+   342→  "output_bytes": 4096,
+   343→  "output_truncated": true,
+   344→  "line_numbers": true,
+   345→  "line_start": 1,
+   346→  "line_end": 50,
+   347→  "duration_ms": 245
+   348→}
+   349→```
+   350→
+   351→**`fetch_page` dengan line numbers:**
+   352→```json
+   353→{
+   354→  "request_id": "req_051",
+   355→  "type": "fetch_page",
+   356→  "response_id": "res_page01",
+   357→  "cursor": "cur_8f7e6d5c4b3a",
+   358→  "options": {
+   359→    "output_limit": 50,
+   360→    "line_numbers": true
+   361→  }
+   362→}
+   363→```
+   364→
+   365→**Response `fetch_page`:**
+   366→```json
+   367→{
+   368→  "request_id": "req_051",
+   369→  "response_id": "res_page01",
+   370→  "type": "page_result",
+   371→  "page": 2,
+   372→  "cursor": "cur_next_cursor",
+   373→  "output": " 51 │ ...\n 52 │ ...\n...",
+   374→  "line_numbers": true,
+   375→  "line_start": 51,
+   376→  "line_end": 100,
+   377→  "output_lines": 127,
+   378→  "has_next": true
+   379→}
+   380→```
+   381→
+   382→#### 5A.4 Implementasi: `visibox_linenums.c`
+   383→
+   384→```c
+   385→// visibox_linenums.c
+   386→
+   387→// Inject line numbers ke string output yang sudah jadi.
+   388→// `line_start` = nomor baris pertama di string ini (absolut, bukan 0-based)
+   389→// `total_lines` = total baris di keseluruhan output (untuk hitung width)
+   390→// Mengembalikan string baru yang dialokasikan, caller harus free().
+   391→char *visibox_linenums_inject(const char *raw_output, size_t line_start,
+   392→                               size_t page_lines, size_t total_lines);
+   393→
+   394→// Helper: hitung jumlah digit yang diperlukan
+   395→int visibox_linenums_width(size_t total_lines) {
+   396→    if (total_lines == 0) return 1;
+   397→    int w = 0;
+   398→    size_t n = total_lines;
+   399→    while (n > 0) { w++; n /= 10; }
+   400→    return w;
+   401→}
+   402→
+   403→// Helper: format satu baris dengan line number
+   404→// Format: {num, right-aligned, width=w} │ {content}
+   405→// Memakai separator dari config (default: " │ ")
+   406→void visibox_linenums_format_line(char *out, size_t out_size,
+   407→                                   size_t line_num, int width,
+   408→                                   const char *separator,
+   409→                                   const char *content, size_t content_len);
+   410→```
+   411→
+   412→**Performa:** Line number injection dilakukan **setelah** output diambil dari buffer, bukan saat buffering. Ini berarti:
+   413→- Buffer tetap menyimpan raw output (tanpa line numbers) — hemat memori
+   414→- Line numbers dihitung on-the-fly saat response dibuat
+   415→- `search_jump` bisa mencari di raw buffer tanpa skip line numbers
+   416→- Format line numbers bisa berbeda antar request (satu client minta line numbers, client lain tidak — output yang sama dari buffer)
+   417→
+   418→#### 5A.5 Edge Cases
+   419→
+   420→| Kasus | Perilaku |
+   421→|---|---|
+   422→| Output kosong (0 baris) | `line_numbers: true` tapi output string kosong. `line_start: 0`, `line_end: 0`. |
+   423→| Baris terakhir tidak memiliki newline | Tetap diberi nomor baris. Line number mengikuti jumlah baris, bukan jumlah newline. |
+   424→| Output hanya 1 baris | Width = 1, format: `1 │ content` |
+   425→| Output 1000+ baris | Width = 4, format: `   1 │ content` ... `1000 │ content` |
+   426→| ANSI escape codes di output | Line numbers diletakkan SEBELUM ANSI codes per baris. Format: `  1 │ \e[31mred text\e[0m` — supaya AI tetap bisa parse ANSI. |
+   427→| `search_jump` + `line_numbers` | Output dari search_jump juga mendukung line_numbers=true, dan nomor barisnya tetap absolut. |
+   428→
+   429→---
+   430→
+   431→### 5B. KEYWORD-BASED PAGINATION JUMP (`search_jump`)
+   432→
+   433→#### 5B.1 Konsep
+   434→
+   435→Saat output command sangat besar (misalnya 10.000 baris log), AI sering perlu mencari sesuatu spesifik (error message, IP address, nama file). Tanpa `search_jump`, AI harus:
+   436→1. Fetch halaman 1, scan manual
+   437→2. Fetch halaman 2, scan manual
+   438→3. ... berulang sampai ketemu
+   439→
+   440→`search_jump` menghilangkan ini dengan satu request: AI kirim keyword, VisiBox cari di seluruh buffered output, dan kembalikan halaman yang mengandung keyword beserta konteks.
+   441→
+   442→#### 5B.2 Request: `search_jump`
+   443→
+   444→```json
+   445→{
+   446→  "request_id": "req_060",
+   447→  "type": "search_jump",
+   448→  "response_id": "res_xxxxxxxx",
+   449→  "keyword": "ERROR",
+   450→  "options": {
+   451→    "case_sensitive": false,
+   452→    "occurrence": 1,
+   453→    "context_lines": 3,
+   454→    "output_limit": 50,
+   455→    "line_numbers": true
+   456→  }
+   457→}
+   458→```
+   459→
+   460→| Field | Wajib | Default | Catatan |
+   461→|---|---|---|---|
+   462→| `response_id` | ya | — | Response ID output yang ingin dicari (harus masih ada di ring buffer) |
+   463→| `keyword` | ya | — | String yang dicari. Bisa mengandung spasi. Tidak support regex di v3 (plaintext substring match). |
+   464→| `options.case_sensitive` | tidak | `false` | Pencarian case-insensitive secara default |
+   465→| `options.occurrence` | tidak | `1` | Kejadian ke-berapa yang diinginkan. `1` = kejadian pertama, `2` = kedua, dst. `-1` = kejadian terakhir. |
+   466→| `options.context_lines` | tidak | `3` | Jumlah baris konteks sebelum dan sesudah baris yang mengandung keyword. Total baris di output = 1 (baris keyword) + 2 × context_lines. |
+   467→| `options.output_limit` | tidak | dari config `pagination.default_page_size` | Batas maksimum baris yang dikembalikan. Jika context terlalu lebar, dipotong. |
+   468→| `options.line_numbers` | tidak | `false` | Sama seperti line numbers di `execute`/`fetch_page` (§5A) |
+   469→
+   470→#### 5B.3 Response: `search_jump_result`
+   471→
+   472→```json
+   473→{
+   474→  "request_id": "req_060",
+   475→  "response_id": "res_xxxxxxxx",
+   476→  "type": "search_jump_result",
+   477→  "keyword": "ERROR",
+   478→  "occurrence": 1,
+   479→  "total_occurrences": 47,
+   480→  "found": true,
+   481→  "found_line": 1842,
+   482→  "line_numbers": true,
+   483→  "line_start": 1839,
+   484→  "line_end": 1845,
+   485→  "output": "1839 │ [INFO] Starting worker process 3\n1840 │ [INFO] Connected to database\n1841 │ [WARN] High memory usage detected\n1842 │ [ERROR] Connection timeout to replica-3\n1843 │ [INFO] Retrying connection (attempt 1/3)\n1844 │ [INFO] Connected to replica-3\n1845 │ [INFO] Worker process 3 ready",
+   486→  "output_truncated": false,
+   487→  "page_hint": 37,
+   488→  "cursor": "cur_page_37_start"
+   489→}
+   490→```
+   491→
+   492→| Field | Arti |
+   493→|---|---|
+   494→| `found` | `true` jika keyword ditemukan, `false` jika tidak ada kejadian. |
+   495→| `total_occurrences` | Total jumlah baris yang mengandung keyword di seluruh output. Berguna buat AI menilai seberapa sering error muncul. |
+   496→| `found_line` | Nomor baris absolut (1-based) di mana keyword ditemukan pada occurrence yang diminta. |
+   497→| `line_start` / `line_end` | Range baris yang dikembalikan (found_line ± context_lines, dibatasi output_limit). |
+   498→| `output` | Baris-baris konteks dengan keyword di tengahnya. Jika `line_numbers: true`, diformat sesuai §5A. |
+   499→| `page_hint` | Nomor halaman yang mengandung `found_line` (berdasarkan page_size). AI bisa langsung `fetch_page` ke halaman ini kalau butuh lebih banyak konteks. |
+   500→| `cursor` | Cursor ke awal halaman `page_hint`. AI bisa pakai ini di `fetch_page` untuk langsung loncat. |
+   501→
+   502→#### 5B.4 Kasus `found: false`
+   503→
+   504→```json
+   505→{
+   506→  "request_id": "req_061",
+   507→  "response_id": "res_xxxxxxxx",
+   508→  "type": "search_jump_result",
+   509→  "keyword": "CRITICAL",
+   510→  "occurrence": 1,
+   511→  "total_occurrences": 0,
+   512→  "found": false,
+   513→  "output": "",
+   514→  "output_truncated": false
+   515→}
+   516→```
+   517→
+   518→Tidak ada error — ini bukan error, keyword memang tidak ada di output. AI bisa lanjut coba keyword lain.
+   519→
+   520→#### 5B.5 Kasus occurrence melebihi total_occurrences
+   521→
+   522→```json
+   523→{
+   524→  "request_id": "req_062",
+   525→  "response_id": "res_xxxxxxxx",
+   526→  "type": "search_jump_result",
+   527→  "keyword": "ERROR",
+   528→  "occurrence": 50,
+   529→  "total_occurrences": 47,
+   530→  "found": false,
+   531→  "output": "",
+   532→  "output_truncated": false
+   533→}
+   534→```
+   535→
+   536→Sama seperti tidak ditemukan — `found: false`. AI tahu dari `total_occurrences` bahwa ada 47 kejadian, tapi occurrence ke-50 tidak ada.
+   537→
+   538→#### 5B.6 Error Cases
+   539→
+   540→| Kondisi | Error Code |
+   541→|---|---|
+   542→| `response_id` sudah di-evict dari ring buffer | `ERR_RESPONSE_EXPIRED` |
+   543→| `keyword` kosong string | `ERR_INVALID_REQUEST` |
+   544→| `occurrence` = 0 | `ERR_INVALID_REQUEST` (occurrence 1-based) |
+   545→
+   546→#### 5B.7 Implementasi: `visibox_search.c`
+   547→
+   548→```c
+   549→// visibox_search.c
+   550→
+   551→// Hasil pencarian
+   552→typedef struct {
+   553→    bool found;
+   554→    size_t found_line;          // 1-based, nomor baris absolut
+   555→    size_t total_occurrences;
+   556→} SearchResult;
+   557→
+   558→// Cari keyword di seluruh output buffer.
+   559→// Mengembalikan SearchResult yang berisi posisi occurrence ke-N.
+   560→// Pencarian dilakukan di raw buffer (tanpa line numbers).
+   561→SearchResult visibox_search_keyword(const OutputBuffer *buf,
+   562→                                     const char *keyword,
+   563→                                     bool case_sensitive,
+   564→                                     int occurrence);
+   565→
+   566→// Ambil baris-baris sekitar found_line sebagai string.
+   567→// line_start dan line_end di-set ke range absolut yang diambil.
+   568→// Jika line_numbers=true, output sudah diformat dengan line numbers.
+   569→// Mengembalikan string baru, caller free().
+   570→char *visibox_search_get_context(const OutputBuffer *buf,
+   571→                                  size_t found_line,
+   572→                                  int context_lines,
+   573→                                  bool line_numbers,
+   574→                                  size_t output_limit,
+   575→                                  size_t *out_line_start,
+   576→                                  size_t *out_line_end);
+   577→```
+   578→
+   579→**Algoritma pencarian:**
+   580→
+   581→```
+   582→1. Akses raw buffer dari OutputBuffer (ter-index per baris)
+   583→2. Iterasi semua baris, lakukan substring match (case-sensitive atau tidak)
+   584→3. Setiap match, increment counter
+   585→4. Ketika counter == occurrence (atau -1 untuk last), catat found_line
+   586→5. Return SearchResult
+   587→```
+   588→
+   589→**Kompleksitas:** O(N × M) dimana N = jumlah baris, M = panjang keyword. Untuk output 100K baris dengan keyword pendek, ini berjalan dalam hitungan milidetik. Tidak perlu index khusus — linear scan cukup karena pencarian hanya dilakukan sekali per request, bukan di hot path.
+   590→
+   591→**Optimasi (jika diperlukan di kemudian hari, bukan di Fase 1):**
+   592→- Boyer-Moore atau memchr untuk keyword pendek
+   593→- Line index (array of offsets) yang sudah ada di OutputBuffer — akses baris ke-N adalah O(1)
+   594→
+   595→#### 5B.8 Hubungan `search_jump` ↔ `fetch_page`
+   596→
+   597→`search_jump` dan `fetch_page` saling melengkapi:
+   598→
+   599→```
+   600→AI menerima output 10.000 baris (truncated)
+   601→  ↓
+   602→AI ingin cari "ERROR" → search_jump
+   603→  ↓
+   604→Response: found_line=1842, page_hint=37, cursor=cur_xxx
+   605→  ↓
+   606→AI ingin lihat lebih banyak konteks → fetch_page(cursor=cur_xxx)
+   607→  ↓
+   608→AI mendapat halaman 37 (baris 1801-1900) dengan line_numbers
+   609→  ↓
+   610→AI merujuk baris spesifik: "baris 1842 menunjukkan ERROR pada replica-3"
+   611→```
+   612→
+   613→Flow ini memungkinkan AI:
+   614→1. Cepat menemukan apa yang dicari tanpa scroll manual
+   615→2. Loncat ke halaman terkait untuk analisis lebih dalam
+   616→3. Merujuk baris spesifik dengan nomor absolut yang unik
+   617→
+   618→---
+   619→
+   620→## 6. PROTOKOL — KONTRAK LENGKAP
+   621→
+   622→Setiap request type di bawah punya: field wajib, field opsional dengan default, dan daftar error yang mungkin. Ini supaya tidak ada celah "AI kirim X, VisiBox tidak tahu harus jawab apa".
+   623→
+   624→### 6.0 Error format standar (dipakai semua request type)
+   625→
+   626→```json
+   627→{
+   628→  "request_id": "req_xxx",
+   629→  "response_id": "res_xxxxxxxx",
+   630→  "type": "error",
+   631→  "error_code": "ERR_SESSION_NOT_FOUND",
+   632→  "error_message": "Session sess_xxx tidak ditemukan atau sudah ditutup",
+   633→  "details": {}
+   634→}
+   635→```
+   636→
+   637→Daftar kode error baku (dipakai konsisten, bukan string bebas per handler):
+   638→
+   639→| Kode | Arti |
+   640→|---|---|
+   641→| `ERR_INVALID_REQUEST` | JSON tidak valid atau field wajib hilang |
+   642→| `ERR_SESSION_NOT_FOUND` | `session_id` tidak ada di registry (sudah ditutup/expired/salah) |
+   643→| `ERR_SESSION_LIMIT_REACHED` | Sudah mencapai `max_sessions`, harus tutup salah satu dulu |
+   644→| `ERR_RESPONSE_EXPIRED` | `reference_response_id` sudah di-evict dari ring buffer |
+   645→| `ERR_CURSOR_INVALID` | Cursor tidak dikenal atau sudah lewat `cursor_expiry_ms` |
+   646→| `ERR_TIMEOUT` | Operasi melewati `timeout_ms` tanpa hasil (bukan error eksekusi, hanya timeout) |
+   647→| `ERR_EXEC_FAILED` | Gagal spawn proses (PTY alloc gagal, command tidak ditemukan, dll) |
+   648→| `ERR_SEARCH_KEYWORD_EMPTY` | `search_jump` dengan keyword kosong (v3) |
+   649→| `ERR_INTERNAL` | Bug internal VisiBox, sertakan detail untuk debug |
+   650→
+   651→### 6.1 `execute`
+   652→
+   653→**Request:**
+   654→```json
+   655→{
+   656→  "request_id": "req_001",
+   657→  "type": "execute",
+   658→  "command": "df -h",
+   659→  "options": {
+   660→    "output_limit": 50,
+   661→    "output_unit": "lines",
+   662→    "timeout_ms": 30000,
+   663→    "line_numbers": true
+   664→  }
+   665→}
+   666→```
+   667→
+   668→| Field | Wajib | Default | Catatan |
+   669→|---|---|---|---|
+   670→| `request_id` | tidak | auto-generate `req_auto_{n}` | |
+   671→| `command` | ya | — | dieksekusi via jalur bash asli (§4.2) |
+   672→| `options.output_limit` | tidak | dari `config.pagination.default_page_size` | `null` = tanpa limit |
+   673→| `options.output_unit` | tidak | `"lines"` | `"lines"` \| `"bytes"` |
+   674→| `options.timeout_ms` | tidak | `30000` | command yang melewati ini di-SIGKILL, response `ERR_TIMEOUT` dengan output partial yang sudah terkumpul |
+   675→| `options.line_numbers` | tidak | `false` | *[BARU v3]* Tambahkan nomor barit absolut ke setiap baris output |
+   676→
+   677→**Response sukses:**
+   678→```json
+   679→{
+   680→  "request_id": "req_001",
+   681→  "response_id": "res_xxxxxxxx",
+   682→  "type": "execute_result",
+   683→  "exit_code": 0,
+   684→  "output": "  1 │ Filesystem      Size  Used Avail Use% Mounted on\n  2 │ /dev/sda1       50G   28G   20G  59% /",
+   685→  "output_lines": 8,
+   686→  "output_bytes": 512,
+   687→  "output_truncated": false,
+   688→  "line_numbers": true,
+   689→  "line_start": 1,
+   690→  "line_end": 8,
+   691→  "duration_ms": 12
+   692→}
+   693→```
+   694→
+   695→**Response tanpa line numbers** (default, backward compatible):
+   696→```json
+   697→{
+   698→  "request_id": "req_001",
+   699→  "response_id": "res_xxxxxxxx",
+   700→  "type": "execute_result",
+   701→  "exit_code": 0,
+   702→  "output": "Filesystem      Size  Used Avail Use% Mounted on\n/dev/sda1       50G   28G   20G  59% /",
+   703→  "output_lines": 8,
+   704→  "output_bytes": 512,
+   705→  "output_truncated": false,
+   706→  "line_numbers": false,
+   707→  "duration_ms": 12
+   708→}
+   709→```
+   710→
+   711→**Kasus timeout:** response tetap dikirim, bukan dianggap gagal total:
+   712→```json
+   713→{
+   714→  "request_id": "req_001",
+   715→  "response_id": "res_xxx",
+   716→  "type": "execute_result",
+   717→  "exit_code": null,
+   718→  "error_code": "ERR_TIMEOUT",
+   719→  "output": "...(output yang terkumpul sampai timeout)...",
+   720→  "output_truncated": true,
+   721→  "timed_out": true
+   722→}
+   723→```
+   724→
+   725→### 6.2 `session_start`
+   726→
+   727→**Request:**
+   728→```json
+   729→{
+   730→  "request_id": "req_010",
+   731→  "type": "session_start",
+   732→  "command": "ssh user@192.168.1.100",
+   733→  "options": {
+   734→    "env": {"TERM": "xterm-256color"},
+   735→    "cwd": "/home/user",
+   736→    "initial_read_timeout_ms": 5000,
+   737→    "output_limit": 100
+   738→  }
+   739→}
+   740→```
+   741→
+   742→Field `initial_read_timeout_ms` (terpisah dari `read_timeout_ms` default session, karena initial banner/prompt biasanya butuh waktu beda dengan read berikutnya). Kalau gagal alloc PTY atau `MAX_SESSIONS` tercapai → `ERR_SESSION_LIMIT_REACHED` atau `ERR_EXEC_FAILED`, tidak ada session yang teregister.
+   743→
+   744→### 6.3 `session_input`
+   745→
+   746→```json
+   747→{
+   748→  "request_id": "req_011",
+   749→  "type": "session_input",
+   750→  "session_id": "sess_9d8e7f6a",
+   751→  "input": "mypassword\n",
+   752→  "options": {
+   753→    "wait_for_prompt": true,
+   754→    "prompt_pattern": "\\$\\s*$",
+   755→    "timeout_ms": 10000,
+   756→    "output_limit": 100,
+   757→    "line_numbers": true
+   758→  }
+   759→}
+   760→```
+   761→
+   762→`prompt_pattern` dicocokkan terhadap output yang sudah di-strip ANSI escape sequence (lewat `visibox_prompt.c`). Field `output` di response tetap berisi raw output (termasuk ANSI). `line_numbers` *[BARU v3]* bekerja sama seperti di `execute`.
+   763→
+   764→Kalau `session_id` tidak ditemukan → `ERR_SESSION_NOT_FOUND`, tidak ada side effect.
+   765→
+   766→### 6.4 `session_read`
+   767→
+   768→Sama seperti v1 — baca tanpa kirim input, untuk polling output baru (misal proses background di session yang sedang jalan lama). Mendukung `line_numbers` *[BARU v3]*.
+   769→
+   770→### 6.5 `session_list`
+   771→
+   772→Sama seperti v1, tambah field `uptime_ms` per session untuk kemudahan AI menilai session mana yang sudah lama idle dan layak ditutup.
+   773→
+   774→### 6.6 `session_close`
+   775→
+   776→Sama seperti v1. Tambahan: kalau `session_id` sudah closed sebelumnya (dipanggil dua kali), response bukan error — kembalikan status `already_closed: true` dengan `final_output` kosong, supaya AI yang retry karena network flaky tidak salah anggap gagal.
+   777→
+   778→### 6.7 `fetch_page` / `session_fetch_page`
+   779→
+   780→```json
+   781→{
+   782→  "request_id": "req_051",
+   783→  "type": "fetch_page",
+   784→  "response_id": "res_page01",
+   785→  "cursor": "cur_8f7e6d5c4b3a",
+   786→  "options": {
+   787→    "output_limit": 50,
+   788→    "line_numbers": true
+   789→  }
+   790→}
+   791→```
+   792→
+   793→Kalau `response_id` sudah di-evict dari ring buffer → `ERR_RESPONSE_EXPIRED`. Kalau cursor valid formatnya tapi sudah lewat `cursor_expiry_ms` → `ERR_CURSOR_INVALID`.
+   794→
+   795→### 6.8 `search_jump` *(BARU v3)*
+   796→
+   797→Lihat detail lengkap di §5B.2 dan §5B.3.
+   798→
+   799→Ringkasan kontrak:
+   800→- **Wajib:** `response_id`, `keyword`
+   801→- **Opsional:** `options.case_sensitive`, `options.occurrence`, `options.context_lines`, `options.output_limit`, `options.line_numbers`
+   802→- **Error:** `ERR_RESPONSE_EXPIRED`, `ERR_INVALID_REQUEST` (keyword kosong / occurrence=0)
+   803→- **Bukan error:** `found: false` — keyword memang tidak ada, AI lanjut coba keyword lain
+   804→
+   805→---
+   806→
+   807→## 7. DATA STRUCTURES
+   808→
+   809→### 7.1 Dari v2 (tidak berubah, diringkas)
+   810→
+   811→```c
+   812→// ═══════════════════════════════════════
+   813→// RESPONSE STORE — bounded ring buffer
+   814→// ═══════════════════════════════════════
+   815→typedef struct {
+   816→    char response_id[16];
+   817→    OutputBuffer *buffer;      // pointer, BUKAN copy — owned oleh store
+   818→    time_t created_at;
+   819→    size_t approx_bytes;       // untuk hitung total_bytes_used di bawah
+   820→} StoreEntry;
+   821→
+   822→typedef struct {
+   823→    StoreEntry entries[VISIBOX_STORE_MAX_ENTRIES];  // dari config, default 256
+   824→    size_t head;                 // posisi FIFO write berikutnya
+   825→    size_t count;
+   826→    size_t total_bytes_used;     // dijaga <= store_max_bytes dari config
+   827→    pthread_mutex_t lock;
+   828→} ResponseStore;
+   829→
+   830→// Eviction: FIFO ketat. Saat entry baru ditambah dan
+   831→// (count == MAX_ENTRIES) ATAU (total_bytes_used + new_entry_bytes > store_max_bytes),
+   832→// entry tertua (head) di-evict dulu sebelum insert.
+   833→// fetch_page/search_jump terhadap response_id yang sudah di-evict → ERR_RESPONSE_EXPIRED.
+   834→
+   835→// ═══════════════════════════════════════
+   836→// EVENT LOOP — satu loop untuk semua session
+   837→// ═══════════════════════════════════════
+   838→typedef struct {
+   839→    int epoll_fd;
+   840→    struct epoll_event events[MAX_SESSIONS];
+   841→    Session *fd_to_session[VISIBOX_MAX_FD];
+   842→} EventLoop;
+   843→
+   844→// ═══════════════════════════════════════
+   845→// PROMPT DETECTION dengan ANSI strip
+   846→// ═══════════════════════════════════════
+   847→char *visibox_strip_ansi(const char *raw, size_t len);
+   848→bool visibox_detect_prompt(const OutputBuffer *buf, const char *pattern);
+   849→```
+   850→
+   851→### 7.2 Baru di v3
+   852→
+   853→```c
+   854→// ═══════════════════════════════════════
+   855→// LINE NUMBERS (visibox_linenums.c)
+   856→// ═══════════════════════════════════════
+   857→
+   858→// Format separator line number (default: " │ ")
+   859→#define VISIBOX_LINENUM_SEP_DEFAULT  " \xe2\x94\x82 "  // UTF-8: │ (U+2502)
+   860→
+   861→typedef struct {
+   862→    char separator[16];         // default: " │ "
+   863→    bool enabled;               // global default dari config
+   864→} LineNumberConfig;
+   865→
+   866→// ═══════════════════════════════════════
+   867→// SEARCH (visibox_search.c)
+   868→// ═══════════════════════════════════════
+   869→
+   870→typedef struct {
+   871→    bool found;
+   872→    size_t found_line;          // 1-based, nomor baris absolut di seluruh output
+   873→    size_t total_occurrences;   // total baris yang mengandung keyword
+   874→} VisiboxSearchResult;
+   875→
+   876→// ═══════════════════════════════════════
+   877→// OUTPUT BUFFER — ditambah field untuk line index
+   878→// ═══════════════════════════════════════
+   879→// OutputBuffer dari v2 sudah menyimpan data per-baris.
+   880→// Untuk v3, ditambahkan line index (array of {offset, length} per baris)
+   881→// supaya akses baris ke-N adalah O(1) — penting untuk search_jump.
+   882→
+   883→typedef struct {
+   884→    size_t offset;    // byte offset di buffer utama
+   885→    size_t length;    // panjang baris (termasuk \n kalau ada)
+   886→} LineEntry;
+   887→
+   888→// Di dalam OutputBuffer:
+   889→//   LineEntry *lines;         // array, di-alloc setelah semua data terkumpul
+   890→//   size_t line_count;        // = total_lines
+   891→//   bool line_index_built;    // lazily built saat pertama kali search_jump/fetch_page dipanggil
+   892→```
+   893→
+   894→**Mengapa line index perlu di-build lazily:** Saat drain pipe, kita tidak tahu berapa total baris sampai selesai. Line index di-build setelah drain selesai, sebelum buffer dimasukkan ke response store. Ini O(N) sekali, lalu setiap akses baris ke-N adalah O(1).
+   895→
+   896→### 7.3 Response struct — ditambah field v3
+   897→
+   898→```c
+   899→// VisiboxResponse — field baru v3
+   900→typedef struct {
+   901→    // ... (field v2 tidak berubah) ...
+   902→
+   903→    // [BARU v3] Line number metadata
+   904→    bool line_numbers;          // apakah output saat ini berisi line numbers
+   905→    size_t line_start;          // nomor baris pertama di output ini (absolut)
+   906→    size_t line_end;            // nomor baris terakhir di output ini (absolut)
+   907→} VisiboxResponse;
+   908→```
+   909→
+   910→---
+   911→
+   912→## 8. CONFIG (UPDATE v3)
+   913→
+   914→```json
+   915→{
+   916→  "pagination": {
+   917→    "mode": "lines",
+   918→    "default_page_size": 100,
+   919→    "max_page_size": 500,
+   920→    "min_page_size": 10,
+   921→    "include_total": true,
+   922→    "cursor_expiry_ms": 300000
+   923→  },
+   924→  "line_numbers": {
+   925→    "default_enabled": false,
+   926→    "separator": " │ ",
+   927→    "max_line_number_width": 6
+   928→  },
+   929→  "search": {
+   930→    "default_context_lines": 3,
+   931→    "max_context_lines": 50,
+   932→    "max_keyword_length": 256,
+   933→    "case_sensitive_default": false
+   934→  },
+   935→  "response_store": {
+   936→    "max_entries": 256,
+   937→    "max_total_bytes": 52428800,
+   938→    "eviction_policy": "fifo"
+   939→  },
+   940→  "sessions": {
+   941→    "max_concurrent": 16,
+   942→    "default_read_timeout_ms": 5000,
+   943→    "default_initial_read_timeout_ms": 5000,
+   944→    "idle_timeout_ms": 1800000,
+   945→    "max_output_buffer_bytes_per_session": 10485760
+   946→  },
+   947→  "execute": {
+   948→    "default_timeout_ms": 30000,
+   949→    "max_timeout_ms": 300000
+   950→  }
+   951→}
+   952→```
+   953→
+   954→Field baru v3:
+   955→- `line_numbers.default_enabled` — global default, bisa di-override per-request via `options.line_numbers`
+   956→- `line_numbers.separator` — string pemisah antara nomor barit dan konten (default: `" │ "`)
+   957→- `line_numbers.max_line_number_width` — batas maksimum lebar kolom nomor barit (untuk output yang sangat panjang, tidak lebih dari 6 digit)
+   958→- `search.default_context_lines` — default jumlah baris konteks di `search_jump`
+   959→- `search.max_context_lines` — batas maksimum context_lines (cegah AI minta 1000 konteks)
+   960→- `search.max_keyword_length` — batas panjang keyword (cegah abuse)
+   961→- `search.case_sensitive_default` — default case sensitivity untuk search
+   962→
+   963→---
+   964→
+   965→## 9. ROADMAP (UPDATE v3)
+   966→
+   967→```
+   968→FASE 1: CORE EXECUTE + LINE NUMBERS + SEARCH (Minggu 1-4)
+   969→├── Fork bash + build system, identifikasi execute_command() di source
+   970→├── Eksperimen: verifikasi cd/export persist via hook di eval.c (test_execute_state.c)
+   971→├── Command ID system (request_id + response_id)
+   972→├── Output capture via fd redirect (BUKAN fork tambahan) — §4.2
+   973→├── Output pagination (lines + bytes mode) + cursor encoding
+   974→├── Line number formatting & injection (visibox_linenums.c) — §5A
+   975→├── Line index pada OutputBuffer (LineEntry array, lazy build) — §7.2
+   976→├── Keyword search engine (visibox_search.c) + search_jump request — §5B
+   977→├── Response store dengan eviction policy (§7) — bukan unbounded
+   978→├── Pipe mode (echo JSON | visibox)
+   979→├── Test suite Fase 1:
+   980→│   ├── test_execute_state.c (regression P1)
+   981→│   ├── test_pagination.c
+   982→│   ├── test_linenums.c (konsistensi nomor barit antar halaman)
+   983→│   └── test_search_jump.c (pencarian, page_hint, context)
+   984→└── CLI client: support line_numbers + search_jump
+   985→
+   986→FASE 2: SESSIONS + EVENT LOOP (Minggu 5-8)
+   987→├── PTY session manager (openpty, login_tty)
+   988→├── Event loop (epoll) dari AWAL — bukan busy-poll yang direfactor nanti
+   989→├── session_start / session_input / session_read / session_close
+   990→├── ANSI strip + prompt detection (visibox_prompt.c)
+   991→├── Session pagination (output_limit per read) + line_numbers support
+   992→├── Session search_jump (cari keyword di output session yang terbuffer)
+   993→├── Idle session sweeper (background thread, cek idle_timeout_ms)
+   994→├── Session list + status
+   995→└── Test: concurrent session (minimal 4 session paralel, verifikasi tidak ada cross-talk)
+   996→
+   997→FASE 3: API & INTERFACE (Minggu 9-11)
+   998→├── REPL mode
+   999→├── Unix socket daemon mode (pakai event loop yang sudah ada dari Fase 2)
+  1000→├── CLI client (visibox-cli) dengan line_numbers + search_jump support
+  1001→└── Multi-client handling lewat daemon (event loop sudah siap, ini cuma wiring)
+  1002→
+  1003→FASE 4: POLISH (Minggu 12-14)
+  1004→├── Error handling lengkap untuk semua kode di §6.0
+  1005→├── Memory limit enforcement (response_store.max_total_bytes, session buffer limit)
+  1006→├── Search performance testing (output 100K+ baris)
+  1007→├── Line number edge cases (ANSI, empty lines, very long lines)
+  1008→├── Dokumentasi protokol final (generate dari §6 di PRD ini)
+  1009→└── Test suite end-to-end (skenario §10 di bawah, dijalankan sebagai integration test)
+  1010→```
+  1011→
+  1012→Catatan: Fase 1 diperluas 1 minggu (dari 3 ke 4) untuk mengakomodasi implementasi line numbers dan search_jump. Fitur-fitur ini ditempatkan di Fase 1 karena mereka beroperasi pada output buffer yang sudah ada — tidak perlu session/PTY infrastructure.
+  1013→
+  1014→---
+  1015→
+  1016→## 10. SKENARIO END-TO-END (untuk integration test)
+  1017→
+  1018→Skenario dasar sama dengan v2 §9 (investigasi server: df, journalctl dengan pagination, ssh session, restart service, close session) sebagai test case Fase 4.
+  1019→
+  1020→### 10.1 Regression test v2: shell state persist
+  1021→
+  1022→```bash
+  1023→{"request_id":"t1","type":"execute","command":"cd /tmp"}
+  1024→→ exit_code: 0
+  1025→
+  1026→{"request_id":"t2","type":"execute","command":"pwd"}
+  1027→→ output harus "/tmp", BUKAN direktori awal proses VisiBox.
+  1028→  Kalau output bukan /tmp, berarti perbaikan #1 di §4.2 gagal — STOP, jangan lanjut ke fase berikutnya.
+  1029→```
+  1030→
+  1031→### 10.2 Test baru v3: line numbers konsistensi
+  1032→
+  1033→```bash
+  1034→# Step 1: Execute dengan line_numbers, output 25 baris, page_size=10
+  1035→{"request_id":"t3","type":"execute","command":"seq 1 25","options":{"output_limit":10,"line_numbers":true}}
+  1036→→ line_start: 1, line_end: 10
+  1037→→ baris pertama: "  1 │ 1"
+  1038→→ baris terakhir: " 10 │ 10"
+  1039→
+  1040→# Step 2: Fetch page 2
+  1041→{"request_id":"t4","type":"fetch_page","response_id":"res_t3","cursor":"cur_xxx","options":{"line_numbers":true}}
+  1042→→ line_start: 11, line_end: 20
+  1043→→ baris pertama: " 11 │ 11"
+  1044→→ baris terakhir: " 20 │ 20"
+  1045→
+  1046→# Step 3: Fetch page 3
+  1047→{"request_id":"t5","type":"fetch_page","response_id":"res_t3","cursor":"cur_yyy","options":{"line_numbers":true}}
+  1048→→ line_start: 21, line_end: 25
+  1049→→ baris pertama: " 21 │ 21"
+  1050→→ baris terakhir: " 25 │ 25"
+  1051→```
+  1052→
+  1053→**Assert:** line_start halaman N = (N-1) × page_size + 1. Nomor barit TIDAK reset per halaman.
+  1054→
+  1055→### 10.3 Test baru v3: search_jump akurasi
+  1056→
+  1057→```bash
+  1058→# Step 1: Generate output besar
+  1059→{"request_id":"t6","type":"execute","command":"seq 1 1000"}
+  1060→→ output_lines: 1000, output_truncated: true
+  1061→
+  1062→# Step 2: Cari keyword "500"
+  1063→{"request_id":"t7","type":"search_jump","response_id":"res_t6","keyword":"500","options":{"line_numbers":true}}
+  1064→→ found: true
+  1065→→ found_line: 500
+  1066→→ total_occurrences: 1
+  1067→→ output berisi: "497 │ 497\n498 │ 498\n499 │ 499\n500 │ 500\n501 │ 501\n502 │ 502\n503 │ 503"
+  1068→→ page_hint: 5 (dengan page_size=100, baris 500 ada di halaman 5)
+  1069→→ cursor valid untuk fetch_page ke halaman 5
+  1070→
+  1071→# Step 3: Cari keyword yang tidak ada
+  1072→{"request_id":"t8","type":"search_jump","response_id":"res_t6","keyword":"2000"}
+  1073→→ found: false
+  1074→→ total_occurrences: 0
+  1075→
+  1076→# Step 4: Cari dengan occurrence > total
+  1077→{"request_id":"t9","type":"search_jump","response_id":"res_t6","keyword":"5","occurrence":300}
+  1078→→ found: false
+  1079→→ total_occurrences: 100 (ada "5", "15", "25", ..., "995")
+  1080→```
+  1081→
+  1082→### 10.4 Test baru v3: search_jump + fetch_page workflow
+  1083→
+  1084→```bash
+  1085→# AI workflow: cari error di log, loncat ke halaman, analisis
+  1086→{"type":"execute","command":"journalctl -n 5000 --no-pager","options":{"output_limit":100,"line_numbers":true}}
+  1087→→ 5000 baris, 50 halaman
+  1088→
+  1089→{"type":"search_jump","response_id":"res_above","keyword":"segfault"}
+  1090→→ found_line: 2341, page_hint: 24, cursor: cur_xxx
+  1091→
+  1092→{"type":"fetch_page","response_id":"res_above","cursor":"cur_xxx","options":{"line_numbers":true}}
+  1093→→ Mendapat halaman 24 (baris 2301-2400) untuk analisis detail
+  1094→→ AI bisa merujuk: "baris 2341 menunjukkan segfault di process nginx"
+  1095→```
+  1096→
+  1097→---
+  1098→
+  1099→## 11. PERTANYAAN TERBUKA (perlu diputuskan sebelum/selama Fase 1, bukan diasumsikan)
+  1100→
+  1101→1. Versi bash source mana yang jadi basis fork? (Pengaruh ke nama fungsi internal seperti `execute_command()` — perlu dicek persis di versi yang dipilih.) → **Sudah diputuskan: GNU Bash 5.3-p15**
+  1102→2. Apakah builtin yang mengubah file descriptor (`exec 3<>file`) perlu penanganan khusus saat fd 1/2 di-redirect sementara untuk capture? (Kemungkinan edge case di §4.2 yang belum diuji.)
+  1103→3. Untuk daemon mode multi-client: apakah satu proses VisiBox melayani banyak AI agent dengan shell state terpisah per client, atau shared state? (Ini keputusan besar — kalau terpisah, butuh banyak instance proses, bukan satu proses dengan banyak koneksi soket ke satu shell yang sama.)
+  1104→4. *[BARU v3]* Apakah `search_jump` perlu mendukung regex atau cukup plaintext substring match? (PRD ini menspesifikasikan plaintext substring untuk v3, regex bisa ditambahkan di versi berikutnya jika ada permintaan.)
+  1105→5. *[BARU v3]* Apakah line numbers perlu mendukung mode "gutter only" (hanya nomor barit, tanpa separator dan content bergabung) untuk bandwidth efficiency? (Saat ini nomor barit di-inject ke dalam string output — tidak ada mode terpisah.)
