@@ -237,7 +237,7 @@ int visibox_parse_request(const char *json_str, VisiboxRequest *req) {
 
     /* Parse "session_id" for session_* */
     if (req->type == VB_REQ_SESSION_INPUT || req->type == VB_REQ_SESSION_READ ||
-        req->type == VB_REQ_SESSION_CLOSE) {
+        req->type == VB_REQ_SESSION_CLOSE || req->type == VB_REQ_SESSION_FETCH_PAGE) {
         if (json_get_string(json_str, "session_id", req->session_id,
                             VISIBOX_ID_LEN) != 0) {
             return -1;
@@ -270,8 +270,8 @@ int visibox_parse_request(const char *json_str, VisiboxRequest *req) {
         }
     }
 
-    /* Parse "cursor" for fetch_page */
-    if (req->type == VB_REQ_FETCH_PAGE) {
+    /* Parse "cursor" for fetch_page / session_fetch_page */
+    if (req->type == VB_REQ_FETCH_PAGE || req->type == VB_REQ_SESSION_FETCH_PAGE) {
         char cur[VISIBOX_ID_LEN];
         if (json_get_string(json_str, "cursor", cur, sizeof(cur)) == 0) {
             req->cursor = strdup(cur);
@@ -307,10 +307,31 @@ int visibox_parse_request(const char *json_str, VisiboxRequest *req) {
             json_get_int(opts, "occurrence", &req->occurrence);
             json_get_int(opts, "context_lines", &req->context_lines);
 
+            /* Fase 2 session options */
+            json_get_bool(opts, "wait_for_prompt", &req->wait_for_prompt);
+            {
+                char pp[VISIBOX_MAX_PROMPT_PATTERN_LEN];
+                if (json_get_string(opts, "prompt_pattern", pp, sizeof(pp)) == 0) {
+                    req->prompt_pattern = strdup(pp);
+                }
+            }
+
             /* page for fetch_page */
             {
                 int page_val = 0;
-                json_get_int(opts, "page", &page_val); /* TODO: separate page field */
+                json_get_int(opts, "page", &page_val);
+            }
+        }
+    }
+
+    /* Fase 2: Parse session_start top-level options */
+    if (req->type == VB_REQ_SESSION_START) {
+        const char *opts2 = json_find_key(json_str, "options");
+        if (opts2) {
+            opts2 = skip_ws(opts2);
+            if (*opts2 == '{') {
+                /* Parse initial_read_timeout_ms */
+                json_get_size(opts2, "initial_read_timeout_ms", &req->timeout_ms);
             }
         }
     }
@@ -397,6 +418,7 @@ char *visibox_serialize_response(const VisiboxResponse *res) {
         APPEND("\"output_truncated\":%s", res->output_truncated ? "true" : "false");
     } else if (res->type == VB_RES_PAGE_RESULT) {
         APPEND("\"type\":\"page_result\",");
+        if (res->session_id[0]) APPEND("\"session_id\":\"%s\",", res->session_id);
         APPEND("\"page\":%d,", res->page);
         APPEND("\"cursor\":\"%s\",", res->cursor);
         if (res->output) {
@@ -408,6 +430,82 @@ char *visibox_serialize_response(const VisiboxResponse *res) {
         APPEND("\"line_end\":%zu,", res->line_end);
         APPEND("\"output_lines\":%zu,", res->output_lines);
         APPEND("\"has_next\":%s", res->has_next ? "true" : "false");
+    } else if (res->type == VB_RES_SESSION_START_RESULT) {
+        APPEND("\"type\":\"session_start_result\",");
+        APPEND("\"session_id\":\"%s\",", res->session_id);
+        APPEND("\"output_lines\":%zu,", res->output_lines);
+        APPEND("\"output_bytes\":%zu,", res->output_bytes);
+        APPEND("\"output_truncated\":%s,", res->output_truncated ? "true" : "false");
+        if (res->line_numbers) {
+            APPEND("\"line_numbers\":true,");
+            APPEND("\"line_start\":%zu,", res->line_start);
+            APPEND("\"line_end\":%zu,", res->line_end);
+        }
+        if (res->output) {
+            json_escape(res->output, escaped, sizeof(escaped));
+            APPEND("\"output\":\"%s\",", escaped);
+        }
+        APPEND("\"has_next\":%s", res->has_next ? "true" : "false");
+    } else if (res->type == VB_RES_SESSION_INPUT_RESULT) {
+        APPEND("\"type\":\"session_input_result\",");
+        APPEND("\"session_id\":\"%s\",", res->session_id);
+        APPEND("\"output_lines\":%zu,", res->output_lines);
+        APPEND("\"output_bytes\":%zu,", res->output_bytes);
+        APPEND("\"prompt_detected\":%s,", res->prompt_detected ? "true" : "false");
+        if (res->has_exit_code)
+            APPEND("\"exit_code\":%d,", res->exit_code);
+        if (res->line_numbers) {
+            APPEND("\"line_numbers\":true,");
+            APPEND("\"line_start\":%zu,", res->line_start);
+            APPEND("\"line_end\":%zu,", res->line_end);
+        }
+        if (res->output) {
+            json_escape(res->output, escaped, sizeof(escaped));
+            APPEND("\"output\":\"%s\"", escaped);
+        } else {
+            APPEND("\"output\":\"\"");
+        }
+    } else if (res->type == VB_RES_SESSION_READ_RESULT) {
+        APPEND("\"type\":\"session_read_result\",");
+        APPEND("\"session_id\":\"%s\",", res->session_id);
+        APPEND("\"output_lines\":%zu,", res->output_lines);
+        APPEND("\"output_bytes\":%zu,", res->output_bytes);
+        if (res->has_exit_code)
+            APPEND("\"exit_code\":%d,", res->exit_code);
+        if (res->line_numbers) {
+            APPEND("\"line_numbers\":true,");
+            APPEND("\"line_start\":%zu,", res->line_start);
+            APPEND("\"line_end\":%zu,", res->line_end);
+        }
+        if (res->output) {
+            json_escape(res->output, escaped, sizeof(escaped));
+            APPEND("\"output\":\"%s\"", escaped);
+        } else {
+            APPEND("\"output\":\"\"");
+        }
+    } else if (res->type == VB_RES_SESSION_LIST_RESULT) {
+        APPEND("\"type\":\"session_list_result\",");
+        APPEND("\"session_count\":%zu,", res->output_lines);
+        if (res->output) {
+            /* session_list output is a JSON array — no need to double-escape */
+            APPEND("\"sessions\":%s", res->output);
+        } else {
+            APPEND("\"sessions\":[]");
+        }
+    } else if (res->type == VB_RES_SESSION_CLOSE_RESULT) {
+        APPEND("\"type\":\"session_close_result\",");
+        APPEND("\"session_id\":\"%s\",", res->session_id);
+        APPEND("\"already_closed\":%s,", res->already_closed ? "true" : "false");
+        if (res->has_exit_code)
+            APPEND("\"exit_code\":%d,", res->exit_code);
+        APPEND("\"output_lines\":%zu,", res->output_lines);
+        APPEND("\"output_bytes\":%zu,", res->output_bytes);
+        if (res->output) {
+            json_escape(res->output, escaped, sizeof(escaped));
+            APPEND("\"output\":\"%s\"", escaped);
+        } else {
+            APPEND("\"output\":\"\"");
+        }
     } else {
         /* execute_result, session_start_result, etc. */
         APPEND("\"type\":\"execute_result\",");

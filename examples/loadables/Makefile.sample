@@ -19,7 +19,7 @@
 
 # these should match the ones in Makefile.in (for the make install target)
 
-prefix = /home/z/my-project/visibox/_build
+prefix = /usr/local
 exec_prefix = ${prefix}
 libdir = ${exec_prefix}/lib
 

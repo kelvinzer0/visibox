@@ -309,6 +309,11 @@ int visibox_pipe_mode(void) {
     if (res.output) free(res.output);
     /* Note: res.full_buffer is owned by the store after dispatch */
 
+    /* Fase 2: cleanup sessions and event loop */
+    visibox_session_cleanup_all();
+    visibox_evloop_destroy();
+    visibox_store_cleanup();
+
     return (rc == 0) ? 0 : 1;
 }
 
@@ -322,6 +327,8 @@ int visibox_main(int argc, char **argv) {
     /* Initialize */
     visibox_init_config();
     visibox_store_init();
+    visibox_session_registry_init();
+    visibox_evloop_init();
     visibox_active = 1;
 
     /* Detect mode */

@@ -8,6 +8,8 @@
 #ifndef VISIBOX_H
 #define VISIBOX_H
 
+#define _GNU_SOURCE  /* for login_tty, pthread_timedjoin_np, etc. */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,7 +21,13 @@
 #include <pthread.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/ioctl.h>
+#include <sys/epoll.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <poll.h>
+#include <pty.h>
+#include <termios.h>
 #include <ctype.h>
 #include <limits.h>
 #include <math.h>
@@ -69,6 +77,17 @@
 
 /* Pipe mode read buffer */
 #define VISIBOX_READ_BUF_SIZE          65536
+
+/* Session / PTY defaults */
+#define VISIBOX_PTY_ROWS               24
+#define VISIBOX_PTY_COLS               80
+#define VISIBOX_SESSION_READ_BUF_SIZE  4096
+#define VISIBOX_SESSION_SWEEP_INTERVAL_MS 2000  /* idle sweep every 2s */
+
+/* Prompt detection */
+#define VISIBOX_DEFAULT_PROMPT_PATTERN  "\\$\\s*$"
+#define VISIBOX_MAX_PROMPT_PATTERN_LEN 256
+#define VISIBOX_MAX_ENV_VARS            32
 
 /* ═══════════════════════════════════════════════════════════════
  * ENUMS
@@ -278,6 +297,7 @@ typedef struct {
     /* Session */
     char              session_id[VISIBOX_ID_LEN];
     int               already_closed;
+    int               prompt_detected;    /* Fase 2: prompt seen after session_input */
 
     /* Error */
     VisiboxErrorCode  error_code;
@@ -314,6 +334,104 @@ typedef struct {
     size_t total_occurrences;
 } VisiboxSearchResult;
 
+/* --- Session State (Fase 2) --- */
+
+typedef enum {
+    VB_SESSION_ALLOCATING,   /* PTY being created */
+    VB_SESSION_RUNNING,      /* process running, PTY active */
+    VB_SESSION_CLOSING,      /* close requested, draining final output */
+    VB_SESSION_CLOSED        /* process exited, resources freed */
+} SessionState;
+
+/* Environment variable pair for session_start options.env */
+typedef struct {
+    char key[128];
+    char val[512];
+} EnvVar;
+
+/* PTY Session — one per interactive process */
+typedef struct {
+    char        session_id[VISIBOX_ID_LEN];
+    SessionState state;
+
+    /* PTY file descriptors */
+    int         master_fd;     /* our side — we read/write this */
+    int         slave_fd;      /* child's side — closed after fork */
+    pid_t       child_pid;     /* PID of the spawned process */
+
+    /* Command that was run */
+    char       *command;
+
+    /* Output buffer — accumulates PTY output for pagination/search */
+    OutputBuffer *output;
+
+    /* Timing */
+    struct timespec created_at;
+    struct timespec last_activity;  /* updated on every read/write */
+    size_t      uptime_ms;
+
+    /* Prompt detection state */
+    char        prompt_pattern[VISIBOX_MAX_PROMPT_PATTERN_LEN];
+    int         prompt_detected;    /* 1 if prompt was seen in recent output */
+    size_t      prompt_offset;      /* byte offset in output->data where prompt starts */
+
+    /* Window size (from session_start or ioctl) */
+    unsigned short rows;
+    unsigned short cols;
+
+    /* Environment overrides */
+    EnvVar      env_overrides[VISIBOX_MAX_ENV_VARS];
+    int         env_count;
+
+    /* CWD override (set before session_start) */
+    char        cwd[1024];
+
+    /* Whether the child has exited */
+    int         child_exited;
+    int         child_exit_status;
+
+    /* Registered in event loop? */
+    int         in_eventloop;
+} VisiboxSession;
+
+/* --- Session Registry (Fase 2) --- */
+
+typedef struct {
+    VisiboxSession sessions[VISIBOX_MAX_SESSIONS];
+    size_t        count;           /* active sessions */
+    pthread_mutex_t lock;
+    int           sweeper_running;
+    pthread_t     sweeper_thread;
+} SessionRegistry;
+
+/* --- Event Loop (Fase 2) --- */
+
+/* Event types that can be returned by the event loop */
+typedef enum {
+    VB_EV_SESSION_OUTPUT,     /* data available on session PTY fd */
+    VB_EV_SESSION_EXITED,     /* child process exited (SIGCHLD) */
+    VB_EV_SESSION_INPUT,      /* session_input needs to write to fd */
+    VB_EV_SOCKET_READ,        /* daemon client connection has data (Fase 3) */
+    VB_EV_SOCKET_ACCEPT,      /* new client connection (Fase 3) */
+    VB_EV_TIMEOUT,            /* poll/epoll timed out */
+    VB_EV_ERROR
+} VisiboxEventType;
+
+typedef struct {
+    VisiboxEventType type;
+    int              fd;           /* which fd triggered */
+    char             session_id[VISIBOX_ID_LEN]; /* if session-related */
+    /* For EV_SESSION_OUTPUT: data is read from the session's output buffer */
+    /* For EV_SESSION_EXITED: session state is updated */
+} VisiboxEvent;
+
+/* Event loop using epoll (P3: no busy-wait) */
+typedef struct {
+    int         epoll_fd;           /* epoll file descriptor */
+    int         sigchld_pipe[2];    /* self-pipe for SIGCHLD notification */
+    int         running;            /* 1 = loop is active */
+} VisiboxEventLoop;
+
 /* ═══════════════════════════════════════════════════════════════
  * GLOBAL STATE
  * ═══════════════════════════════════════════════════════════════ */
@@ -323,6 +441,12 @@ extern VisiboxConfig visibox_config;
 
 /* Global response store */
 extern ResponseStore visibox_store;
+
+/* Global session registry (Fase 2) */
+extern SessionRegistry visibox_sessions;
+
+/* Global event loop (Fase 2) */
+extern VisiboxEventLoop visibox_evloop;
 
 /* Flag: are we in visibox mode (vs normal bash)? */
 extern int visibox_active;
@@ -403,5 +527,47 @@ int  visibox_execute_and_capture (const char *command, VisiboxResponse *res);
 size_t visibox_min (size_t a, size_t b);
 size_t visibox_max (size_t a, size_t b);
 long   visibox_timespec_diff_ms (struct timespec *start, struct timespec *end);
+
+/* --- visibox_session.c (Fase 2) --- */
+void    visibox_session_registry_init (void);
+int     visibox_session_count (void);
+VisiboxSession *visibox_session_create (const char *command);
+VisiboxSession *visibox_session_find (const char *session_id);
+int     visibox_session_destroy (const char *session_id);
+int     visibox_session_is_alive (VisiboxSession *s);
+void    visibox_session_update_activity (VisiboxSession *s);
+void    visibox_session_sweep_idle (void);
+void   *visibox_session_sweeper_thread (void *arg);
+void    visibox_session_cleanup_all (void);
+
+/* --- visibox_session_pty.c (Fase 2) --- */
+int     visibox_pty_spawn (VisiboxSession *s, const char *command);
+int     visibox_pty_write (VisiboxSession *s, const char *data, size_t len);
+int     visibox_pty_read_into_buffer (VisiboxSession *s);
+int     visibox_pty_resize (VisiboxSession *s, unsigned short rows, unsigned short cols);
+void    visibox_pty_close_fds (VisiboxSession *s);
+void    visibox_pty_reap_child (VisiboxSession *s);
+
+/* --- visibox_eventloop.c (Fase 2) --- */
+int     visibox_evloop_init (void);
+int     visibox_evloop_add_fd (int fd, uint32_t events, char *session_id);
+int     visibox_evloop_remove_fd (int fd);
+int     visibox_evloop_wait (VisiboxEvent *event, int timeout_ms);
+void    visibox_evloop_destroy (void);
+void    visibox_evloop_handle_sigchld (void);
+
+/* --- visibox_prompt.c (Fase 2) --- */
+char   *visibox_strip_ansi (const char *raw, size_t len, size_t *out_len);
+int     visibox_detect_prompt (const char *stripped, size_t len, const char *pattern);
+int     visibox_session_wait_for_prompt (VisiboxSession *s, const char *pattern,
+                                          int timeout_ms, OutputBuffer *out_buf);
+
+/* --- visibox_dispatch.c (Fase 2 additions) --- */
+int visibox_handle_session_start (VisiboxRequest *req, VisiboxResponse *res);
+int visibox_handle_session_input (VisiboxRequest *req, VisiboxResponse *res);
+int visibox_handle_session_read (VisiboxRequest *req, VisiboxResponse *res);
+int visibox_handle_session_list (VisiboxRequest *req, VisiboxResponse *res);
+int visibox_handle_session_close (VisiboxRequest *req, VisiboxResponse *res);
+int visibox_handle_session_fetch_page (VisiboxRequest *req, VisiboxResponse *res);
 
 #endif /* VISIBOX_H */
