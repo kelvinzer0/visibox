@@ -38,7 +38,7 @@ jobs:
         run: |
           test -x bash
           ./bash --version | head -1
-          echo '{"type":"execute","command":"echo hello visibox"}' | ./bash
+          echo '{"type":"execute","command":"echo hello visibox"}' | ./bash --visibox
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -106,7 +106,7 @@ jobs:
             ### Quick Start
             ```bash
             tar xzf visibox-x86_64-linux-gnu.tar.gz
-            echo '{"type":"execute","command":"echo hello"}' | ./visibox
+            echo '{"type":"execute","command":"echo hello"}' | ./visibox --visibox
             ```
           files: visibox-x86_64-linux-gnu.tar.gz
           draft: false
