@@ -494,7 +494,8 @@ CSOURCES = shell.c eval.c parse.y general.c make_cmd.c print_cmd.c y.tab.c \
         shell/visibox_linenums.c shell/visibox_search.c shell/visibox_store.c \
         shell/visibox_protocol.c shell/visibox_dispatch.c \
         shell/visibox_session.c shell/visibox_session_pty.c \
-        shell/visibox_eventloop.c shell/visibox_prompt.c
+        shell/visibox_eventloop.c shell/visibox_prompt.c \
+        shell/visibox_config_loader.c shell/visibox_daemon.c shell/visibox_repl.c
 
 HSOURCES = shell.h flags.h trap.h hashcmd.h hashlib.h jobs.h builtins.h \
         general.h variables.h config.h $(ALLOC_HEADERS) alias.h \
@@ -547,7 +548,8 @@ OBJECTS  = shell.o eval.o y.tab.o general.o make_cmd.o print_cmd.o \
         shell/visibox_linenums.o shell/visibox_search.o shell/visibox_store.o \
         shell/visibox_protocol.o shell/visibox_dispatch.o \
         shell/visibox_session.o shell/visibox_session_pty.o \
-        shell/visibox_eventloop.o shell/visibox_prompt.o
+        shell/visibox_eventloop.o shell/visibox_prompt.o \
+        shell/visibox_config_loader.o shell/visibox_daemon.o shell/visibox_repl.o
 
 # Where the source code of the shell builtins resides.
 BUILTIN_SRCDIR=$(srcdir)/builtins

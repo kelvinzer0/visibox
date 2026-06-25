@@ -240,6 +240,10 @@ int protected_mode = 0;         /* No command substitution with --wordexp */
 
 int pretty_print_mode = 0;      /* pretty-print a shell script */
 int visibox_mode = 0;           /* VisiBox JSON protocol mode */
+int visibox_flag_repl = 0;      /* VisiBox REPL mode (Fase 3) */
+int visibox_flag_daemon = 0;    /* VisiBox daemon mode (Fase 3) */
+char *visibox_socket_path = (char *)0x0;  /* Fase 3: --visibox-socket PATH */
+char *visibox_pid_file = (char *)0x0;     /* Fase 3: --visibox-pid-file PATH */
 
 #if defined (STRICT_POSIX)
 int posixly_correct = 1;        /* Non-zero means posix.2 superset. */
@@ -282,6 +286,10 @@ static const struct {
   { "verbose", Int, &verbose_flag, (char **)0x0 },
   { "version", Int, &do_version, (char **)0x0 },
   { "visibox", Int, &visibox_mode, (char **)0x0 },
+  { "visibox-repl", Int, &visibox_flag_repl, (char **)0x0 },
+  { "visibox-daemon", Int, &visibox_flag_daemon, (char **)0x0 },
+  { "visibox-socket", Charp, (int *)0x0, &visibox_socket_path },
+  { "visibox-pid-file", Charp, (int *)0x0, &visibox_pid_file },
 #if defined (WORDEXP_OPTION)
   { "wordexp", Int, &wordexp_only, (char **)0x0 },
 #endif
@@ -840,8 +848,10 @@ main (int argc, char **argv, char **env)
    * Bash is fully initialized at this point: builtins, signals,
    * variables, job control, etc. are all ready.
    * visibox_main() will call parse_and_execute() internally.
+   *
+   * Fase 3: --visibox-repl and --visibox-daemon auto-enable visibox_mode.
    * ═══════════════════════════════════════════════════════════════ */
-  if (visibox_mode) {
+  if (visibox_mode || visibox_flag_repl || visibox_flag_daemon) {
     exit_shell (visibox_main (argc, argv));
   }
 

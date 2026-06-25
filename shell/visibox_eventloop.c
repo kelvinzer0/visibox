@@ -182,8 +182,26 @@ int visibox_evloop_wait(VisiboxEvent *event, int timeout_ms) {
         return 0;
     }
 
-    /* Check for errors */
+    /* Fase 3: Check for listen socket (new connection) */
+    if (fd == visibox_evloop.listen_fd && (ev.events & EPOLLIN)) {
+        event->type = VB_EV_SOCKET_ACCEPT;
+        event->fd = fd;
+        memset(event->session_id, 0, VISIBOX_ID_LEN);
+        return 0;
+    }
+
+    /* Check for errors or hangup */
     if (ev.events & (EPOLLERR | EPOLLHUP)) {
+        /* Fase 3: If this is a non-session fd (client socket), use HUP */
+        if (fd >= 0 && fd != visibox_evloop.listen_fd &&
+            fd != visibox_evloop.sigchld_pipe[0] &&
+            (fd >= VISIBOX_MAX_FD || fd_to_session[fd][0] == '\0')) {
+            /* This is a client socket, not a session PTY */
+            event->type = VB_EV_SOCKET_HUP;
+            event->fd = fd;
+            memset(event->session_id, 0, VISIBOX_ID_LEN);
+            return 0;
+        }
         /* PTY closed or error — treat as session exit */
         event->type = VB_EV_SESSION_EXITED;
         event->fd = fd;
@@ -193,13 +211,27 @@ int visibox_evloop_wait(VisiboxEvent *event, int timeout_ms) {
         return 0;
     }
 
-    /* Data available on a session PTY */
+    /* Data available — could be session PTY or client socket */
     if (ev.events & EPOLLIN) {
-        event->type = VB_EV_SESSION_OUTPUT;
-        event->fd = fd;
-        if (fd < VISIBOX_MAX_FD) {
+        if (fd >= 0 && fd < VISIBOX_MAX_FD && fd_to_session[fd][0] != '\0') {
+            /* Session PTY has data */
+            event->type = VB_EV_SESSION_OUTPUT;
+            event->fd = fd;
             strncpy(event->session_id, fd_to_session[fd], VISIBOX_ID_LEN - 1);
+        } else {
+            /* Fase 3: Client socket has data */
+            event->type = VB_EV_SOCKET_READ;
+            event->fd = fd;
+            memset(event->session_id, 0, VISIBOX_ID_LEN);
         }
+        return 0;
+    }
+
+    /* Fase 3: Write-ready for client socket */
+    if (ev.events & EPOLLOUT) {
+        event->type = VB_EV_SOCKET_READ;  /* reuse — caller checks client state */
+        event->fd = fd;
+        memset(event->session_id, 0, VISIBOX_ID_LEN);
         return 0;
     }
 

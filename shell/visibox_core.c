@@ -5,11 +5,13 @@
  * to capture output via fd redirect (dup2), without forking a new shell.
  * (PRD v2 §4.2 — the critical design that makes `cd`/`export` persist.)
  *
- * Two modes:
+ * Three modes:
  *   PIPE MODE:  echo '{"type":"execute","command":"ls"}' | visibox
  *               Read one JSON request from stdin, execute, write JSON response to stdout.
- *   REPL MODE:  (Fase 3) Interactive JSON REPL on unix socket.
- *   DAEMON MODE: (Fase 3) Background daemon serving multiple clients.
+ *   REPL MODE:  visibox --repl
+ *               Interactive JSON REPL: read line, execute, print response, repeat.
+ *   DAEMON MODE: visibox --daemon [--socket PATH] [--pid-file PATH]
+ *               Unix socket daemon serving multiple clients via epoll.
  */
 
 #include "visibox.h"
@@ -86,12 +88,28 @@ void visibox_init_config(void) {
 void visibox_detect_mode(int argc, char **argv, VisiboxMode *mode) {
     *mode = VB_MODE_PIPE;
 
+    /* Fase 3: check bash-level flags set by shell.c long options */
+    extern int visibox_flag_repl;
+    extern int visibox_flag_daemon;
+
+    if (visibox_flag_daemon) {
+        *mode = VB_MODE_DAEMON;
+        return;
+    }
+    if (visibox_flag_repl) {
+        *mode = VB_MODE_REPL;
+        return;
+    }
+
+    /* Also check argv for flexibility (e.g., when called programmatically) */
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--repl") == 0 || strcmp(argv[i], "-r") == 0) {
+        if (strcmp(argv[i], "--repl") == 0 || strcmp(argv[i], "-r") == 0 ||
+            strcmp(argv[i], "--visibox-repl") == 0) {
             *mode = VB_MODE_REPL;
             return;
         }
-        if (strcmp(argv[i], "--daemon") == 0 || strcmp(argv[i], "-d") == 0) {
+        if (strcmp(argv[i], "--daemon") == 0 || strcmp(argv[i], "-d") == 0 ||
+            strcmp(argv[i], "--visibox-daemon") == 0) {
             *mode = VB_MODE_DAEMON;
             return;
         }
@@ -105,7 +123,28 @@ void visibox_detect_mode(int argc, char **argv, VisiboxMode *mode) {
     if (!isatty(STDIN_FILENO)) {
         *mode = VB_MODE_PIPE;
     } else {
-        *mode = VB_MODE_PIPE; /* default for now, REPL in Fase 3 */
+        *mode = VB_MODE_PIPE;
+    }
+}
+
+/* Parse --socket, --pid-file, --config flags from argv. */
+static void parse_extra_args(int argc, char **argv,
+                             const char **out_socket,
+                             const char **out_pid,
+                             const char **out_config) {
+    /* Fase 3: Prefer bash-level flags set by shell.c long options */
+    extern char *visibox_socket_path;
+    extern char *visibox_pid_file;
+
+    *out_socket = visibox_socket_path;
+    *out_pid = visibox_pid_file;
+    *out_config = NULL;
+
+    /* Also check argv for --config (not registered as bash long opt) */
+    for (int i = 1; i < argc - 1; i++) {
+        if (strcmp(argv[i], "--config") == 0) {
+            *out_config = argv[i + 1]; i++;
+        }
     }
 }
 
@@ -324,29 +363,42 @@ int visibox_pipe_mode(void) {
 int visibox_main(int argc, char **argv) {
     VisiboxMode mode;
 
-    /* Initialize */
+    /* Initialize defaults first */
     visibox_init_config();
+
+    /* Detect mode early to know which args to parse */
+    visibox_detect_mode(argc, argv, &mode);
+
+    /* Fase 3: Load config file */
+    const char *cfg_path = NULL;
+    const char *sock_path = NULL;
+    const char *pid_path = NULL;
+
+    if (mode == VB_MODE_DAEMON || mode == VB_MODE_REPL) {
+        parse_extra_args(argc, argv, &sock_path, &pid_path, &cfg_path);
+    }
+
+    /* Try default config path if not specified */
+    if (!cfg_path) {
+        cfg_path = "config/visibox.conf";
+    }
+    visibox_load_config(cfg_path);
+
+    /* Initialize subsystems */
     visibox_store_init();
     visibox_session_registry_init();
     visibox_evloop_init();
     visibox_active = 1;
-
-    /* Detect mode */
-    visibox_detect_mode(argc, argv, &mode);
 
     switch (mode) {
         case VB_MODE_PIPE:
             return visibox_pipe_mode();
 
         case VB_MODE_REPL:
-            /* Fase 3 */
-            fprintf(stderr, "visibox: REPL mode not yet implemented (Fase 3)\n");
-            return 1;
+            return visibox_repl_mode();
 
         case VB_MODE_DAEMON:
-            /* Fase 3 */
-            fprintf(stderr, "visibox: Daemon mode not yet implemented (Fase 3)\n");
-            return 1;
+            return visibox_daemon_mode(sock_path, pid_path);
     }
 
     return 1;

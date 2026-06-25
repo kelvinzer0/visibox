@@ -1,0 +1,115 @@
+name: CI Build & Auto Release
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libncurses-dev
+
+      - name: Configure
+        run: ./configure
+
+      - name: Build
+        run: make -j$(nproc)
+
+      - name: Verify binary
+        run: |
+          test -x bash
+          ./bash --version | head -1
+          echo '{"type":"execute","command":"echo hello visibox"}' | ./bash
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: visibox-${{ matrix.os }}
+          path: bash
+          retention-days: 7
+
+  release:
+    name: Create Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libncurses-dev
+
+      - name: Configure
+        run: ./configure
+
+      - name: Build (release)
+        run: make -j$(nproc)
+
+      - name: Strip binary
+        run: cp bash visibox && strip visibox
+
+      - name: Create tarball
+        run: tar czf visibox-x86_64-linux-gnu.tar.gz visibox
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          PREV_TAG=$(git tag --sort=-version:refname | grep -v "^$TAG$" | head -1)
+          if [ -n "$PREV_TAG" ]; then
+            CHANGES=$(git log --pretty=format:"- %s (%h)" "$PREV_TAG..$TAG" --no-merges)
+          else
+            CHANGES=$(git log --pretty=format:"- %s (%h)" --no-merges)
+          fi
+          echo "changes<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$CHANGES" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: VisiBox ${{ github.ref_name }}
+          body: |
+            ## VisiBox ${{ github.ref_name }}
+
+            AI Agent Execution Engine — fork of GNU Bash 5.3 with JSON protocol.
+
+            ### Changes
+            ${{ steps.changelog.outputs.changes }}
+
+            ### Assets
+            - `visibox-x86_64-linux-gnu.tar.gz` — pre-built binary (stripped, glibc-linked)
+
+            ### Quick Start
+            ```bash
+            tar xzf visibox-x86_64-linux-gnu.tar.gz
+            echo '{"type":"execute","command":"echo hello"}' | ./visibox
+            ```
+          files: visibox-x86_64-linux-gnu.tar.gz
+          draft: false
+          prerelease: ${{ contains(github.ref_name, 'rc') || contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -89,6 +89,13 @@
 #define VISIBOX_MAX_PROMPT_PATTERN_LEN 256
 #define VISIBOX_MAX_ENV_VARS            32
 
+/* Daemon / Socket (Fase 3) */
+#define VISIBOX_MAX_CLIENTS             32
+#define VISIBOX_DEFAULT_SOCKET_PATH     "/tmp/visibox.sock"
+#define VISIBOX_DEFAULT_PID_FILE        "/tmp/visibox.pid"
+#define VISIBOX_CLIENT_READ_BUF_SIZE    (1024 * 1024)  /* 1 MB */
+#define VISIBOX_MAX_REQUEST_SIZE        (1024 * 1024)  /* 1 MB */
+
 /* ═══════════════════════════════════════════════════════════════
  * ENUMS
  * ═══════════════════════════════════════════════════════════════ */
@@ -413,6 +420,7 @@ typedef enum {
     VB_EV_SESSION_INPUT,      /* session_input needs to write to fd */
     VB_EV_SOCKET_READ,        /* daemon client connection has data (Fase 3) */
     VB_EV_SOCKET_ACCEPT,      /* new client connection (Fase 3) */
+    VB_EV_SOCKET_HUP,         /* client disconnected (Fase 3) */
     VB_EV_TIMEOUT,            /* poll/epoll timed out */
     VB_EV_ERROR
 } VisiboxEventType;
@@ -429,8 +437,30 @@ typedef struct {
 typedef struct {
     int         epoll_fd;           /* epoll file descriptor */
     int         sigchld_pipe[2];    /* self-pipe for SIGCHLD notification */
+    int         listen_fd;          /* daemon: unix socket listen fd (Fase 3) */
     int         running;            /* 1 = loop is active */
 } VisiboxEventLoop;
+
+/* --- Client Connection (Fase 3) --- */
+
+typedef enum {
+    VB_CLIENT_READING,      /* reading request bytes */
+    VB_CLIENT_PROCESSING,   /* dispatching/executing */
+    VB_CLIENT_WRITING       /* sending response */
+} ClientState;
+
+typedef struct {
+    int         fd;             /* client socket fd */
+    ClientState state;
+    char       *read_buf;       /* accumulating request bytes */
+    size_t      read_len;       /* bytes in read_buf */
+    size_t      read_cap;       /* allocated capacity of read_buf */
+    char       *write_buf;      /* response to send */
+    size_t      write_len;      /* bytes remaining to write */
+    size_t      write_pos;      /* current write offset */
+    struct timespec connected_at;
+    int         active;         /* 1 = slot in use */
+} VisiboxClient;
 
 /* ═══════════════════════════════════════════════════════════════
  * GLOBAL STATE
@@ -569,5 +599,18 @@ int visibox_handle_session_read (VisiboxRequest *req, VisiboxResponse *res);
 int visibox_handle_session_list (VisiboxRequest *req, VisiboxResponse *res);
 int visibox_handle_session_close (VisiboxRequest *req, VisiboxResponse *res);
 int visibox_handle_session_fetch_page (VisiboxRequest *req, VisiboxResponse *res);
+
+/* --- visibox_daemon.c (Fase 3) --- */
+int  visibox_daemon_mode (const char *socket_path, const char *pid_file);
+void visibox_daemon_shutdown (void);
+
+/* --- visibox_repl.c (Fase 3) --- */
+int  visibox_repl_mode (void);
+
+/* --- visibox_config_loader.c (Fase 3) --- */
+int  visibox_load_config (const char *path);
+
+/* --- visibox_client.c (Fase 3) --- */
+int  visibox_client_main (int argc, char **argv);
 
 #endif /* VISIBOX_H */
