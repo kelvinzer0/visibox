@@ -36,7 +36,18 @@ echo '{"type":"execute","command":"pwd"}' | ./bash
 
 ## Quick Start
 
-### Build
+### One-line install (pre-built binary)
+
+```bash
+bash <(curl -sL https://raw.githubusercontent.com/kelvinzer0/visibox/master/install.sh)
+```
+
+Install specific version:
+```bash
+VISIBOX_VERSION=0.1.0 bash <(curl -sL https://raw.githubusercontent.com/kelvinzer0/visibox/master/install.sh)
+```
+
+### Build from source
 
 ```bash
 git clone https://github.com/kelvinzer0/visibox.git
