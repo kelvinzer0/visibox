@@ -739,7 +739,7 @@ int visibox_handle_session_fetch_page(VisiboxRequest *req, VisiboxResponse *res)
 
     if (res->has_next) {
         /* Encode page number in cursor */
-        snprintf(res->cursor, VISIBOX_ID_LEN, "cur_page_%d", page + 1);
+        snprintf(res->cursor, VISIBOX_ID_LEN, "cur_%zu", (size_t)(page + 1));
     }
 
     /* Apply line numbers if requested */
