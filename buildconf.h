@@ -45,8 +45,8 @@
 /* Don't assume this; it's from C99; let syntax.h define a replacement */
 /* #undef HAVE_ISBLANK */
 
-/* #undef PROCESS_SUBSTITUTION */
+#define PROCESS_SUBSTITUTION 1
 
-/* #undef EXTENDED_GLOB */
+#define EXTENDED_GLOB 1
 
 #endif /* BUILDCONF_H */

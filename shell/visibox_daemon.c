@@ -139,114 +139,13 @@ static int client_process_request(VisiboxClient *c) {
     if (visibox_parse_request(c->read_buf, &req) != 0) {
         visibox_make_error(NULL, &res, VB_ERR_INVALID_REQUEST,
                            "Failed to parse JSON request");
-    } else if (req.type == VB_REQ_EXECUTE) {
-        /*
-         * FASE 3: Fork a child process for execute requests.
-         *
-         * bash's parse_and_execute() is NOT safe to call multiple times
-         * outside reader_loop() — calling it twice causes SIGABRT/SEGFAULT
-         * due to stale internal state. The solution: fork a fresh child
-         * for each execute. Shell state (cwd, env) is scoped to that
-         * child's connection lifetime (per PRD v3 open question #3).
-         */
-        int resp_pipe[2];
-        if (pipe(resp_pipe) < 0) {
-            visibox_make_error(&req, &res, VB_ERR_INTERNAL,
-                               "pipe() failed for execute fork");
-        } else {
-            pid_t pid = fork();
-            if (pid < 0) {
-                close(resp_pipe[0]); close(resp_pipe[1]);
-                visibox_make_error(&req, &res, VB_ERR_INTERNAL, "fork() failed");
-            } else if (pid == 0) {
-                /* ── CHILD: handle execute in fresh process ── */
-                close(resp_pipe[0]);
-                /* Set close-on-exec so pipe closes when child exits */
-                fcntl(resp_pipe[1], F_SETFD, FD_CLOEXEC);
-
-                /* Close inherited daemon fds */
-                if (visibox_evloop.listen_fd >= 0)
-                    close(visibox_evloop.listen_fd);
-                if (visibox_evloop.sigchld_pipe[0] >= 0)
-                    close(visibox_evloop.sigchld_pipe[0]);
-                if (visibox_evloop.sigchld_pipe[1] >= 0)
-                    close(visibox_evloop.sigchld_pipe[1]);
-                if (self_shutdown_pipe[0] >= 0)
-                    close(self_shutdown_pipe[0]);
-                if (self_shutdown_pipe[1] >= 0)
-                    close(self_shutdown_pipe[1]);
-
-                visibox_dispatch_request(&req, &res);
-
-                /* Serialize response and write to pipe */
-                char *rj = visibox_serialize_response(&res);
-                if (rj) {
-                    size_t jlen = strlen(rj);
-                    char hdr[32];
-                    int hlen = snprintf(hdr, sizeof(hdr), "%zx\n", jlen);
-                    (void)write(resp_pipe[1], hdr, (size_t)hlen);
-                    (void)write(resp_pipe[1], rj, jlen);
-                    (void)write(resp_pipe[1], "\n", 1);
-                    free(rj);
-                }
-                if (req.command) free(req.command);
-                if (req.keyword) free(req.keyword);
-                if (req.input) free(req.input);
-                if (req.cursor) free(req.cursor);
-                if (req.prompt_pattern) free(req.prompt_pattern);
-                if (res.output) free(res.output);
-                _exit(0);
-            } else {
-                /* ── PARENT: read serialized response from child ── */
-                close(resp_pipe[1]);
-
-                /* Read length header */
-                char hdr_buf[32];
-                size_t hp = 0;
-                while (hp < sizeof(hdr_buf) - 1) {
-                    ssize_t n = read(resp_pipe[0], hdr_buf + hp, 1);
-                    if (n <= 0) break;
-                    if (hdr_buf[hp] == '\n') break;
-                    hp++;
-                }
-                hdr_buf[hp] = '\0';
-
-                size_t plen = (hp > 0) ? (size_t)strtoull(hdr_buf, NULL, 16) : 0;
-                int got_response = 0;
-
-                if (plen > 0 && plen < VISIBOX_MAX_REQUEST_SIZE) {
-                    c->write_buf = (char *)malloc(plen + 2);
-                    if (c->write_buf) {
-                        size_t rd = 0;
-                        while (rd < plen) {
-                            ssize_t n = read(resp_pipe[0],
-                                              c->write_buf + rd, plen - rd);
-                            if (n <= 0) break;
-                            rd += (size_t)n;
-                        }
-                        c->write_buf[rd] = '\0';
-                        c->write_len = rd;
-                        c->write_pos = 0;
-                        c->state = VB_CLIENT_WRITING;
-                        got_response = 1;
-                    }
-                }
-                close(resp_pipe[0]);
-                waitpid(pid, NULL, 0);
-
-                if (got_response) {
-                    visibox_evloop_remove_fd(c->fd);
-                    visibox_evloop_add_fd(c->fd, EPOLLOUT, NULL);
-                    c->read_len = 0;
-                    return 0;
-                }
-                /* Fall through: generate error response */
-                visibox_make_error(&req, &res, VB_ERR_INTERNAL,
-                                   "execute child failed");
-            }
-        }
     } else {
-        /* Non-execute: dispatch directly (session ops, fetch, search) */
+        /*
+         * Dispatch ALL requests directly in the daemon process.
+         * This is the critical P1 design: execute runs via parse_and_execute()
+         * in THIS process, so shell state (cwd, env, alias) persists.
+         * Same approach as REPL mode — proven safe.
+         */
         visibox_dispatch_request(&req, &res);
     }
 
@@ -256,23 +155,20 @@ static int client_process_request(VisiboxClient *c) {
     if (req.input) free(req.input);
     if (req.cursor) free(req.cursor);
     if (req.prompt_pattern) free(req.prompt_pattern);
-    if (res.output) free(res.output);
 
-    /* Serialize response */
+    /* Serialize response — raw JSON + newline (same format as REPL mode) */
     char *resp_json = visibox_serialize_response(&res);
     if (!resp_json) {
         resp_json = strdup("{\"type\":\"error\",\"error_code\":\"ERR_INTERNAL\","
                            "\"error_message\":\"serialization failed\"}");
     }
 
-    /* Prepare for writing: "<hex-length>\n<json>\n" */
     size_t json_len = strlen(resp_json);
-    size_t total = 64 + json_len + 2;
+    size_t total = json_len + 2;  /* json + \n + \0 */
 
     c->write_buf = (char *)malloc(total);
     if (c->write_buf) {
-        c->write_len = snprintf(c->write_buf, total, "%zx\n%s\n",
-                                json_len, resp_json);
+        c->write_len = snprintf(c->write_buf, total, "%s\n", resp_json);
         c->write_pos = 0;
         c->state = VB_CLIENT_WRITING;
 
@@ -284,6 +180,7 @@ static int client_process_request(VisiboxClient *c) {
     }
 
     free(resp_json);
+    if (res.output) free(res.output);
     c->read_len = 0;
     return 0;
 }

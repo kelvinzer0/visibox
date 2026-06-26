@@ -226,11 +226,14 @@ int visibox_execute_and_capture(const char *command, VisiboxResponse *res) {
 #ifndef SEVAL_NOHIST
 #define SEVAL_NOHIST    0x004
 #endif
+#ifndef SEVAL_NOFREE
+#define SEVAL_NOFREE    0x008
+#endif
 
     /* parse_and_execute is declared in externs.h, defined in builtins/evalstring.c */
     extern int parse_and_execute (char *, const char *, int);
     int exit_code = parse_and_execute((char *)command, "visibox",
-                                       SEVAL_NOHIST | SEVAL_NONINT);
+                                       SEVAL_NOHIST | SEVAL_NONINT | SEVAL_NOFREE);
 
     clock_gettime(CLOCK_MONOTONIC, &end);
 
