@@ -61,11 +61,17 @@ info "Extracting..."
 tar xzf "${TMPDIR}/${ARCHIVE}" -C "$TMPDIR"
 
 # ── install ──
-if [ -w "$INSTALL_DIR" ] || [ "$EUID" -eq 0 ]; then
+mkdir -p "$INSTALL_DIR"
+if [ -w "$INSTALL_DIR" ]; then
+    cp "${TMPDIR}/visibox" "${INSTALL_DIR}/visibox"
+    chmod +x "${INSTALL_DIR}/visibox"
+    ok "Installed to ${INSTALL_DIR}/visibox"
+elif [ "$EUID" -eq 0 ]; then
     cp "${TMPDIR}/visibox" "${INSTALL_DIR}/visibox"
     chmod +x "${INSTALL_DIR}/visibox"
     ok "Installed to ${INSTALL_DIR}/visibox"
 else
+    sudo mkdir -p "$INSTALL_DIR"
     sudo cp "${TMPDIR}/visibox" "${INSTALL_DIR}/visibox"
     sudo chmod +x "${INSTALL_DIR}/visibox"
     ok "Installed to ${INSTALL_DIR}/visibox (via sudo)"
