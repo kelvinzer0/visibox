@@ -12,8 +12,8 @@ VisiBox is a modified GNU Bash that accepts commands via **JSON** and returns st
 Unlike shell wrappers that spawn a subprocess per command, VisiBox hooks directly into Bash's execution engine. This means shell state — `cd`, `export`, `alias` — **persists across commands**, exactly like an interactive shell.
 
 ```
-echo '{"type":"execute","command":"cd /tmp"}' | ./bash
-echo '{"type":"execute","command":"pwd"}' | ./bash
+echo '{"type":"execute","command":"cd /tmp"}' | ./visibox --visibox
+echo '{"type":"execute","command":"pwd"}' | ./visibox --visibox
 # → output: "/tmp"  ✓  state persisted
 ```
 
@@ -56,26 +56,26 @@ cd visibox
 make
 ```
 
-The build produces a single `bash` binary with all VisiBox capabilities embedded.
+The build produces a single `visibox` binary (renamed from `bash`) with all VisiBox capabilities embedded.
 
 ### Usage Modes
 
 **1. Pipe Mode** — single JSON request via stdin:
 
 ```bash
-echo '{"type":"execute","command":"df -h","options":{"output_limit":10}}' | ./bash
+echo '{"type":"execute","command":"df -h","options":{"output_limit":10}}' | ./visibox --visibox
 ```
 
 **2. REPL Mode** — interactive JSON session:
 
 ```bash
-./bash --visibox-repl
+./visibox --visibox-repl
 ```
 
 **3. Daemon Mode** — Unix socket server for multi-client access:
 
 ```bash
-./bash --visibox-daemon --socket /tmp/visibox.sock
+./visibox --visibox-daemon --socket /tmp/visibox.sock
 ```
 
 ---
